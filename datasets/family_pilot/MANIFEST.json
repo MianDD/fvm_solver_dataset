@@ -1,0 +1,58 @@
+{
+  "n_sims": 2,
+  "n_ok": 2,
+  "ood": false,
+  "problem": "ellipse",
+  "seed": 12345,
+  "family_spec": {
+    "gamma": [
+      1.2,
+      1.45
+    ],
+    "viscosity": [
+      0.0005,
+      0.005
+    ],
+    "visc_bulk": [
+      0.001,
+      0.02
+    ],
+    "thermal_cond": [
+      1e-07,
+      1e-05
+    ],
+    "C_v": [
+      1.5,
+      3.5
+    ],
+    "T_0": [
+      80.0,
+      120.0
+    ],
+    "rho_inf": [
+      0.8,
+      1.2
+    ],
+    "T_inf": [
+      80.0,
+      120.0
+    ],
+    "v_n_inf": [
+      3.0,
+      8.0
+    ],
+    "ood_gamma": [
+      1.45,
+      1.65
+    ],
+    "ood_viscosity": [
+      0.005,
+      0.01
+    ],
+    "ood_v_n_inf": [
+      8.0,
+      12.0
+    ]
+  },
+  "out_root": "C:\\Users\\Lenovo\\Desktop\\MPhil Dissertation\\fvm_solver-main\\fvm_solver-main\\datasets\\family_pilot"
+}

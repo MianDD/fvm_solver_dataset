@@ -1,0 +1,46 @@
+--- STDOUT ---
+[32mCreating new mesh for ellipse[0m
+[32mNumber of mesh cells: 829[0m
+[32mNumber of mesh edges: 1294[0m
+[95mComputing mesh properties[0m
+[35m_init_bc done[0m
+[35mComplete init FVMEdgeInfo[0m
+[95mConstricting flux matrix[0m
+[96mSaving results to C:\Users\Lenovo\Desktop\MPhil Dissertation\fvm_solver-main\fvm_solver-main\datasets\family_pilot\sim_0001[0m
+[32mSaved mesh properties to 'C:\Users\Lenovo\Desktop\MPhil Dissertation\fvm_solver-main\fvm_solver-main\datasets\family_pilot\sim_0001/mesh_props.npz'[0m
+[35mDeleted temp variables[0m
+[95mDone FVMEquation[0m
+[92mi = 0, t = 0.0005, avg_dt = 0.000489, irl_time = 0.000279[0m
+[93mt = 0.0005[0m
+[96mSaving at t=0.010378[0m
+[96mSaving at t=0.020517[0m
+[92mi = 50, t = 0.02567, avg_dt = 0.000504, irl_time = 0.0175[0m
+[96mSaving at t=0.030905[0m
+[96mSaving at t=0.041071[0m
+[96mSaving at t=0.051516[0m
+dts[500:].mean() = tensor(nan)
+SIM_DONE C:\Users\Lenovo\Desktop\MPhil Dissertation\fvm_solver-main\fvm_solver-main\datasets\family_pilot\sim_0001
+
+--- STDERR ---
+WARNING:root:Mesh generation process timed out.
+WARNING:root:Mesh generation process timed out.
+WARNING:root:Mesh generation process timed out.
+WARNING:root:Mesh generation process timed out.
+WARNING:root:Mesh generation process timed out.
+WARNING:root:Mesh generation process timed out.
+WARNING:root:Mesh generation process timed out.
+WARNING:root:Mesh generation process timed out.
+WARNING:root:Mesh generation process timed out.
+WARNING:root:Mesh generation process timed out.
+WARNING:root:Mesh generation process timed out.
+WARNING:root:Mesh generation process timed out.
+WARNING:root:Mesh generation process timed out.
+WARNING:root:Mesh generation process timed out.
+WARNING:root:Mesh generation process timed out.
+WARNING:root:Mesh generation process timed out.
+C:\Users\Lenovo\Desktop\MPhil Dissertation\fvm_solver-main\fvm_solver-main\time_fvm\fvm_mesh.py:42: UserWarning: Sparse invariant checks are implicitly disabled. Memory errors (e.g. SEGFAULT) will occur when operating on a sparse tensor which violates the invariants, but checks incur performance overhead. To silence this warning, explicitly opt in or out. See `torch.sparse.check_sparse_tensor_invariants.__doc__` for guidance.  (Triggered internally at C:\actions-runner\_work\pytorch\pytorch\pytorch\aten\src\ATen\Context.cpp:767.)
+  A = torch.sparse_coo_tensor(indices, values, (n_cells, n_cells + n_boundaries))
+C:\Users\Lenovo\Desktop\MPhil Dissertation\fvm_solver-main\fvm_solver-main\time_fvm\sparse_utils.py:290: UserWarning: Sparse CSR tensor support is in beta state. If you miss a functionality in the sparse tensor support, please submit a feature request to https://github.com/pytorch/pytorch/issues. (Triggered internally at C:\actions-runner\_work\pytorch\pytorch\pytorch\aten\src\ATen\SparseCsrTensorImpl.cpp:51.)
+  A = A.to_sparse_csr()
+
+--- elapsed: 165.7s    return code: 0 ---
