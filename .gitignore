@@ -1,3 +1,4 @@
+# Artefacts
 /artefacts/*
 
 # Byte-compiled / optimized / DLL files
@@ -41,3 +42,27 @@ htmlcov/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Local model checkpoints / training outputs
+checkpoints/
+
+# Local CFD/FVM generated test datasets
+datasets/family_test*/
+datasets/grid_test*/
+datasets/smoke_robust/
+datasets/_codex_*/
+
+# Large generated datasets
+datasets/family_v1*/
+datasets/grid_v1*/
+datasets/ood*/
+datasets/grid_ood*/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
