@@ -13,10 +13,22 @@ from time_fvm.config_fvm import ConfigFVM, ConfigNozzle, ConfigEllipse
 
 def generate_mesh(cfg: ConfigFVM):
     c_print(f'Creating new mesh for {cfg.problem_setup}', "green")
+    mesh_worker_retries = getattr(cfg, "mesh_worker_retries", getattr(cfg, "max_mesh_retries", 2))
+    mesh_attempt_timeout_s = getattr(cfg, "mesh_attempt_timeout_s", 10)
     if cfg.problem_setup == "nozzle":
-        mesh_stuff = gen_mesh_nozzle(areas=[cfg.min_A, cfg.max_A], cell_lnscale=cfg.lnscale)
+        mesh_stuff = gen_mesh_nozzle(
+            areas=[cfg.min_A, cfg.max_A],
+            cell_lnscale=cfg.lnscale,
+            max_retries=mesh_worker_retries,
+            attempt_timeout_s=mesh_attempt_timeout_s,
+        )
     elif cfg.problem_setup == "ellipse":
-        mesh_stuff = gen_rand_mesh(areas=[cfg.min_A, cfg.max_A], cell_lnscale=cfg.lnscale)
+        mesh_stuff = gen_rand_mesh(
+            areas=[cfg.min_A, cfg.max_A],
+            cell_lnscale=cfg.lnscale,
+            max_retries=mesh_worker_retries,
+            attempt_timeout_s=mesh_attempt_timeout_s,
+        )
     else:
         raise ValueError(f'Unknown mode {cfg.problem_setup}')
 

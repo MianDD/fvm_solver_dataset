@@ -152,6 +152,34 @@ def pde_fingerprint(cfg: Dict) -> np.ndarray:
     ], dtype=np.float32)
 
 
+def timestep_files(sim_dir: Path) -> List[Path]:
+    """Return sorted FVM timestep files in ``sim_dir``."""
+    t_files = sorted(p for p in sim_dir.iterdir()
+                     if p.name.startswith("t_") and p.name.endswith(".npz"))
+    t_files.sort(key=lambda p: float(p.name[len("t_"):-len(".npz")]))
+    return t_files
+
+
+def simulation_skip_reason(sim_dir: Path) -> str | None:
+    """Return a human-readable skip reason, or None if the sim is usable."""
+    status_path = sim_dir / "status.json"
+    if status_path.exists():
+        try:
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            return f"invalid status.json ({exc})"
+        if status.get("status") != "success":
+            failed_stage = status.get("failed_stage", "unknown")
+            reason = status.get("reason", "no reason recorded")
+            return f"status={status.get('status')} failed_stage={failed_stage} reason={reason}"
+
+    if not (sim_dir / "mesh_props.npz").exists():
+        return "no mesh_props.npz"
+    if not timestep_files(sim_dir):
+        return "no t_*.npz snapshots"
+    return None
+
+
 # --------------------------------------------------------------------------
 # Sweep-level conversion
 # --------------------------------------------------------------------------
@@ -170,8 +198,9 @@ def assemble_dataset(sweep_dir: str | Path, out_dir: str | Path,
                       if p.is_dir() and p.name.startswith("sim_"))
     saved: List[str] = []
     for sd in sim_dirs:
-        if not (sd / "mesh_props.npz").exists():
-            print(f"  SKIP {sd.name}: no mesh_props.npz")
+        skip_reason = simulation_skip_reason(sd)
+        if skip_reason is not None:
+            print(f"  SKIP {sd.name}: {skip_reason}")
             continue
         snaps, times, cfg = convert_one_sim(sd, grid_H=grid_H, grid_W=grid_W)
         if not np.all(np.isfinite(snaps)):
@@ -188,6 +217,11 @@ def assemble_dataset(sweep_dir: str | Path, out_dir: str | Path,
         saved.append(str(out_path))
         print(f"  WRITE {out_path.name}: snaps={snaps.shape}  "
               f"gamma={cfg.get('gamma', 0):.2f}  mu={cfg.get('viscosity', 0):.1e}")
+    if not saved:
+        raise RuntimeError(
+            f"No successful simulations found in {sweep_dir}. "
+            "Check status.json, mesh_props.npz, and t_*.npz files."
+        )
     return saved
 
 
@@ -199,7 +233,10 @@ def main() -> None:
     ap.add_argument("--H", type=int, default=64)
     ap.add_argument("--W", type=int, default=96)
     args = ap.parse_args()
-    saved = assemble_dataset(args.sweep, args.out, args.H, args.W)
+    try:
+        saved = assemble_dataset(args.sweep, args.out, args.H, args.W)
+    except RuntimeError as exc:
+        raise SystemExit(f"ERROR: {exc}") from exc
     print(f"\nWrote {len(saved)} simulations to {args.out}")
 
 

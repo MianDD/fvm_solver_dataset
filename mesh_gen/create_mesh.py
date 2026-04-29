@@ -3,7 +3,12 @@ import multiprocessing as mp
 import queue
 from cprint import c_print
 import logging
+import traceback
 from meshpy import triangle as tri
+
+
+class MeshGenerationError(RuntimeError):
+    """Raised when mesh generation cannot produce a valid mesh in time."""
 
 
 def min_dist_to_boundary(point, seg_points, segment_indices):
@@ -103,36 +108,58 @@ def _create_mesh_thread(holes, points, p_marks, segments, seg_marks, mesh_props,
     out_queue.put(("ok", mesh_specs))
 
 
-def safe_run(args):
-    """ Run mesh generation in a separate process to catch crashes/hangs, and repeat if it happens. """
-    while True:
+def _create_mesh_thread_safe(*args):
+    """Wrap the mesh worker so exceptions are sent back to the parent process."""
+    out_queue = args[-1]
+    try:
+        _create_mesh_thread(*args)
+    except Exception as exc:
+        reason = f"{type(exc).__name__}: {exc}"
+        out_queue.put(("error", f"{reason}\n{traceback.format_exc()}"))
+
+
+def safe_run(args, max_retries=2, timeout_s=10):
+    """Run mesh generation in a child process with bounded retries."""
+    max_retries = max(1, int(max_retries))
+    timeout_s = max(1, float(timeout_s))
+    last_reason = "mesh generation timeout"
+
+    for attempt in range(1, max_retries + 1):
         ctx = mp.get_context("spawn")  # safer / more predictable on many platforms
         out_queue = ctx.Queue()
-        p = ctx.Process(target=_create_mesh_thread, args=tuple(args + [out_queue]))
+        p = ctx.Process(target=_create_mesh_thread_safe, args=tuple(args + [out_queue]))
         p.start()
         try:
-            # Wait up to 10 seconds for a message from the child
-            status, payload = out_queue.get(timeout=10)
+            status, payload = out_queue.get(timeout=timeout_s)
         except queue.Empty:
-            # Child didn't send anything in time (hung or crashed)
+            last_reason = "mesh generation timeout"
             if p.is_alive():
                 p.terminate()
             p.join()
-            logging.warning("Mesh generation process timed out.")
+            logging.warning(
+                "Mesh generation process timed out "
+                f"(attempt {attempt}/{max_retries}, timeout={timeout_s:g}s)."
+            )
             continue
-        if status == "error":
-            logging.warning("Exception in mesh generation process:\n" + payload[1])
-            continue
-        else:
-            mesh_specs = payload
+
+        if p.is_alive():
             p.terminate()
-            p.join()
-            break
+        p.join()
 
-    return mesh_specs
+        if status == "error":
+            last_reason = str(payload).strip()
+            logging.warning(
+                "Exception in mesh generation process "
+                f"(attempt {attempt}/{max_retries}):\n{last_reason}"
+            )
+            continue
+
+        return payload
+
+    raise MeshGenerationError(last_reason)
 
 
-def create_mesh(coords: list, mesh_props, min_angle=None):
+def create_mesh(coords: list, mesh_props, min_angle=None, max_retries=2, attempt_timeout_s=10):
     # Collate together all facet objects
     points, segments = np.zeros((0, 2)), np.zeros((0, 2), dtype=int)
     # Segments for dist calculation
@@ -162,5 +189,9 @@ def create_mesh(coords: list, mesh_props, min_angle=None):
             dist_p = np.concatenate((dist_p, facets.points))
             dist_seg = np.concatenate((dist_seg, facets.segments + cur_dist_p))
 
-    mesh_specs = safe_run([holes, points, p_marks, segments, seg_marks, mesh_props, dist_p, dist_seg, min_angle])
+    mesh_specs = safe_run(
+        [holes, points, p_marks, segments, seg_marks, mesh_props, dist_p, dist_seg, min_angle],
+        max_retries=max_retries,
+        timeout_s=attempt_timeout_s,
+    )
     return mesh_specs, marker_names

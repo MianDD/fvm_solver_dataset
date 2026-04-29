@@ -5,7 +5,7 @@ from mesh_gen.geometries import Line, Ellipse, Nozzle, Circle
 from mesh_gen.create_mesh import create_mesh
 
 
-def gen_mesh_nozzle(areas, cell_lnscale=2):
+def gen_mesh_nozzle(areas, cell_lnscale=2, max_retries=2, attempt_timeout_s=10):
     xmin, xmax = -0.25, 6
     ymin, ymax = -2.25, 1.5
 
@@ -29,7 +29,12 @@ def gen_mesh_nozzle(areas, cell_lnscale=2):
 
     ]
 
-    mesh_specs, marker_tags = create_mesh(coords, mesh_props)
+    mesh_specs, marker_tags = create_mesh(
+        coords,
+        mesh_props,
+        max_retries=max_retries,
+        attempt_timeout_s=attempt_timeout_s,
+    )
     _point_props, _markers, _edges = mesh_specs
 
     points, triangles = _point_props
@@ -42,7 +47,7 @@ def gen_mesh_nozzle(areas, cell_lnscale=2):
     return points, triangles, (int_edges, bound_edges), f_tag
 
 
-def gen_mesh_tunnel(areas, cell_lnscale=2):
+def gen_mesh_tunnel(areas, cell_lnscale=2, max_retries=2, attempt_timeout_s=10):
     xmin, xmax = 0, 2
     ymin, ymax = 0, 1.5
 
@@ -61,7 +66,13 @@ def gen_mesh_tunnel(areas, cell_lnscale=2):
 
     ]
 
-    mesh_specs, marker_tags = create_mesh(coords, mesh_props, min_angle=30)
+    mesh_specs, marker_tags = create_mesh(
+        coords,
+        mesh_props,
+        min_angle=30,
+        max_retries=max_retries,
+        attempt_timeout_s=attempt_timeout_s,
+    )
     _point_props, _markers, _edges = mesh_specs
 
     points, triangles = _point_props
@@ -74,7 +85,7 @@ def gen_mesh_tunnel(areas, cell_lnscale=2):
     return points, triangles, (int_edges, bound_edges), f_tag
 
 
-def gen_rand_mesh(areas, cell_lnscale=2):
+def gen_rand_mesh(areas, cell_lnscale=2, max_retries=2, attempt_timeout_s=10):
     xmin, xmax = 0, 2
     ymin, ymax = 0, 1.5
 
@@ -97,7 +108,13 @@ def gen_rand_mesh(areas, cell_lnscale=2):
                       lengthscale=lengthscale, hole=True, dist_req=True, name="NavierWall")
         coords.append(e)
 
-    mesh_specs, marker_tags = create_mesh(coords, mesh_props, min_angle=30)
+    mesh_specs, marker_tags = create_mesh(
+        coords,
+        mesh_props,
+        min_angle=30,
+        max_retries=max_retries,
+        attempt_timeout_s=attempt_timeout_s,
+    )
     _point_props, _markers, _edges = mesh_specs
 
     points, triangles = _point_props
