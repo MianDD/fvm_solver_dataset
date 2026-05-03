@@ -49,6 +49,16 @@ nearby generalisation tests, and `--family ood_hard` for stress testing. Mesh
 sampling is separate from PDE/physics sampling; enable it with
 `--sample-mesh-params`.
 
+For CSD3 runs where random ellipse mesh generation is unstable, use
+`--geometry-mode fixed_ellipse`. This keeps one deterministic ellipse geometry
+and varies only the physical/PDE family parameters across simulations:
+
+```powershell
+.\.venv\Scripts\python.exe -m sweep.sweep_fvm --out datasets\raw_fixed_id20_csd3 `
+  --n 20 --family id --geometry-mode fixed_ellipse --device cpu `
+  --min-A 0.2 --max-A 0.4 --lnscale 3
+```
+
 ## B. Summarize Raw Dataset
 
 ```powershell
@@ -204,6 +214,8 @@ Submit the templates in `scripts/` after replacing `YOUR_PROJECT`:
 
 ```bash
 sbatch scripts/csd3_sweep.slurm
+sbatch scripts/csd3_sweep_fixed_tiny.slurm
+sbatch scripts/csd3_sweep_fixed_id20.slurm
 sbatch scripts/csd3_grid.slurm
 sbatch scripts/csd3_train_cpu.slurm
 sbatch scripts/csd3_train_gpu.slurm

@@ -98,5 +98,10 @@ spacing with a warning. Targets remain `[V_x, V_y, rho, T]`.
 `--horizon` is currently fixed to `1`. Multi-horizon training and evaluation
 are not implemented yet.
 
+For reliable CSD3 dataset generation when random ellipse meshing is unstable,
+use `python -m sweep.sweep_fvm --geometry-mode fixed_ellipse ...`. This keeps
+one deterministic ellipse geometry and still varies the sampled physical/PDE
+parameters across simulations.
+
 For the complete workflow, including CSD3 templates, see
 [`docs/workflow.md`](docs/workflow.md).

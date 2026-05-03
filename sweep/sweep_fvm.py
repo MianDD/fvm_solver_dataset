@@ -153,7 +153,9 @@ sys.path.insert(0, os.path.join(REPO_ROOT, 'time_fvm'))
 
 
 KEY_STATUS_FIELDS = (
-    "sim_id", "seed", "mesh_seed", "family", "problem", "lnscale", "min_A", "max_A",
+    "sim_id", "seed", "mesh_seed", "family", "problem", "geometry_mode",
+    "fixed_geometry_spec",
+    "lnscale", "min_A", "max_A",
     "gamma", "viscosity", "visc_bulk", "thermal_cond", "C_v",
     "T_0", "rho_inf", "T_inf", "v_n_inf",
 )
@@ -243,6 +245,102 @@ def _mesh_failure_reason(exc):
     if "timeout" in text.lower():
         return "mesh generation timeout"
     return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+
+
+def _generate_fixed_ellipse_mesh(cfg):
+    # One deterministic ellipse-in-channel mesh for stable CSD3 sweeps.
+    # This bypasses stochastic MeshPy refinement and returns the same interface
+    # as time_fvm.run_fvm.generate_mesh.
+    xmin, xmax = 0.0, 2.0
+    ymin, ymax = 0.0, 1.5
+    cx, cy = 0.85, 0.75
+    a = 0.18
+    ecc = 0.55
+    b = a * np.sqrt(1.0 - ecc ** 2)
+
+    max_area = max(float(cfg.max_A), 1e-6)
+    h = max(np.sqrt(max_area), 1e-3)
+    nx = int(np.clip(np.ceil((xmax - xmin) / h), 24, 160))
+    ny = int(np.clip(np.ceil((ymax - ymin) / h), 18, 120))
+
+    xs = np.linspace(xmin, xmax, nx + 1)
+    ys = np.linspace(ymin, ymax, ny + 1)
+    X, Y = np.meshgrid(xs, ys, indexing="xy")
+    points = np.stack([X.ravel(), Y.ravel()], axis=1).astype(np.float64)
+
+    def vid(i, j):
+        return j * (nx + 1) + i
+
+    triangles = []
+    for j in range(ny):
+        for i in range(nx):
+            candidates = [
+                [vid(i, j), vid(i + 1, j), vid(i + 1, j + 1)],
+                [vid(i, j), vid(i + 1, j + 1), vid(i, j + 1)],
+            ]
+            for tri in candidates:
+                centroid = points[tri].mean(axis=0)
+                inside = ((centroid[0] - cx) / a) ** 2 + ((centroid[1] - cy) / b) ** 2 < 1.0
+                if not inside:
+                    triangles.append(tri)
+    triangles = np.asarray(triangles, dtype=np.int32)
+    if len(triangles) == 0:
+        raise RuntimeError("fixed_ellipse structured mesh produced no triangles")
+
+    edge_counts = {}
+    for tri in triangles:
+        for edge in ((tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])):
+            key = tuple(sorted((int(edge[0]), int(edge[1]))))
+            edge_counts[key] = edge_counts.get(key, 0) + 1
+
+    int_edges = []
+    bound_edges = []
+    edge_tag = []
+    tol = 1e-10
+    for edge, count in sorted(edge_counts.items()):
+        if count == 2:
+            int_edges.append(edge)
+        elif count == 1:
+            p0, p1 = points[list(edge)]
+            if abs(p0[0] - xmin) < tol and abs(p1[0] - xmin) < tol:
+                tag = "Left"
+            elif abs(p0[0] - xmax) < tol and abs(p1[0] - xmax) < tol:
+                tag = "Right"
+            else:
+                tag = "NavierWall"
+            bound_edges.append(edge)
+            edge_tag.append(tag)
+        else:
+            raise RuntimeError(f"unexpected edge count {count} in fixed_ellipse mesh")
+
+    if not bound_edges:
+        raise RuntimeError("fixed_ellipse structured mesh produced no boundary edges")
+    return (
+        points,
+        triangles,
+        (np.asarray(int_edges, dtype=np.int64), np.asarray(bound_edges, dtype=np.int64)),
+        edge_tag,
+    )
+
+
+def _generate_mesh(cfg, params):
+    if params.get("geometry_mode", "random_ellipse") == "fixed_ellipse":
+        _log("mesh_generation_mode", "fixed_ellipse deterministic one-obstacle channel")
+        import torch
+        mesh_stuff = _generate_fixed_ellipse_mesh(cfg)
+        Xs, tri_idx, (int_edgs, bound_edgs), edge_tag = mesh_stuff
+        Xs = torch.from_numpy(Xs).float()
+        tri_idx = torch.from_numpy(tri_idx).int()
+        int_edgs = torch.from_numpy(int_edgs)
+        bound_edgs = torch.from_numpy(bound_edgs)
+        all_edgs = torch.cat([int_edgs, bound_edgs], dim=0)
+        bc_edge_mask = torch.cat([
+            torch.zeros_like(int_edgs[:, 0], dtype=torch.bool),
+            torch.ones_like(bound_edgs[:, 0], dtype=torch.bool),
+        ], dim=0)
+        return Xs, tri_idx, all_edgs, bc_edge_mask, edge_tag, bound_edgs
+    from time_fvm.run_fvm import generate_mesh
+    return generate_mesh(cfg)
 
 
 def _snapshot_files(out_dir):
@@ -381,7 +479,7 @@ def _run():
                 ),
             )
             try:
-                prob = generate_mesh(cfg)
+                prob = _generate_mesh(cfg, params)
                 Xs, tri_idx, all_edgs, bc_edge_mask, edge_tag, bound_edgs = prob
                 _log(
                     "mesh_generation_success",
@@ -483,7 +581,7 @@ if __name__ == '__main__':
 
 
 MANIFEST_PARAM_KEYS = (
-    "family", "mesh_seed",
+    "family", "geometry_mode", "fixed_geometry_spec", "mesh_seed",
     "gamma", "viscosity", "visc_bulk", "thermal_cond", "C_v",
     "T_0", "rho_inf", "T_inf", "v_n_inf", "lnscale", "min_A", "max_A",
 )
@@ -519,6 +617,8 @@ def _write_status(out_dir: Path, params: Dict, status: str, *,
         "mesh_seed": params.get("mesh_seed"),
         "family": params.get("family"),
         "problem": params.get("problem"),
+        "geometry_mode": params.get("geometry_mode"),
+        "fixed_geometry_spec": params.get("fixed_geometry_spec"),
         "lnscale": params.get("lnscale"),
         "min_A": params.get("min_A"),
         "max_A": params.get("max_A"),
@@ -680,6 +780,9 @@ def main() -> None:
     ap.add_argument("--family", choices=sorted(FAMILY_SPECS), default="id",
                     help="controlled parameter family to sample")
     ap.add_argument("--problem", choices=["ellipse", "nozzle"], default="ellipse")
+    ap.add_argument("--geometry-mode", choices=["random_ellipse", "fixed_ellipse"],
+                    default="random_ellipse",
+                    help="ellipse geometry source; default preserves random ellipse meshes")
     ap.add_argument("--seed", type=int, default=12345)
     ap.add_argument("--n-iter", type=int, default=2500)
     ap.add_argument("--end-t", type=float, default=2.0)
@@ -711,6 +814,8 @@ def main() -> None:
     args = ap.parse_args()
 
     family_name = "ood_mild" if args.ood and args.family == "id" else args.family
+    if args.geometry_mode == "fixed_ellipse" and args.problem != "ellipse":
+        ap.error("--geometry-mode fixed_ellipse is only valid with --problem ellipse")
 
     repo = Path(args.repo).resolve()
     out_root = Path(args.out).resolve()
@@ -729,7 +834,8 @@ def main() -> None:
     rng = np.random.default_rng(args.seed)
 
     print(
-        f"Sweep: n={args.n}  family={family.name}  ood_flag={args.ood}  problem={args.problem}",
+        f"Sweep: n={args.n}  family={family.name}  ood_flag={args.ood}  "
+        f"problem={args.problem}  geometry_mode={args.geometry_mode}",
         flush=True,
     )
     print(f"Repo : {repo}\nOut  : {out_root}", flush=True)
@@ -740,11 +846,20 @@ def main() -> None:
     sim_records = []
     for i in range(args.n):
         physics = family.sample_physics(rng)
-        mesh_params = (
-            family.sample_mesh(rng)
-            if args.sample_mesh_params
-            else {"lnscale": args.lnscale, "min_A": args.min_A, "max_A": args.max_A}
-        )
+        if args.geometry_mode == "fixed_ellipse":
+            if args.sample_mesh_params and i == 0:
+                print(
+                    "WARNING: --sample-mesh-params is ignored in fixed_ellipse mode; "
+                    "using CLI lnscale/min_A/max_A for all simulations.",
+                    flush=True,
+                )
+            mesh_params = {"lnscale": args.lnscale, "min_A": args.min_A, "max_A": args.max_A}
+        else:
+            mesh_params = (
+                family.sample_mesh(rng)
+                if args.sample_mesh_params
+                else {"lnscale": args.lnscale, "min_A": args.min_A, "max_A": args.max_A}
+            )
         sim_seed = int(args.seed + 1000 * (10 if family.name != "id" else 1) + i)
         mesh_seed = sim_seed
         params = {
@@ -753,6 +868,18 @@ def main() -> None:
             "mesh_seed": mesh_seed,
             "family": family.name,
             "problem": args.problem,
+            "geometry_mode": args.geometry_mode,
+            "fixed_geometry_spec": (
+                {
+                    "domain": [0.0, 0.0, 2.0, 1.5],
+                    "ellipse_center": [0.85, 0.75],
+                    "ellipse_semi_major_axis": 0.18,
+                    "ellipse_eccentricity": 0.55,
+                    "ellipse_angle": 0.0,
+                    "mesh_type": "deterministic_structured_triangles",
+                }
+                if args.geometry_mode == "fixed_ellipse" else None
+            ),
             "device": args.device,
             "compile": bool(args.compile),
             "dt": args.dt, "n_iter": args.n_iter, "end_t": args.end_t,
@@ -794,6 +921,7 @@ def main() -> None:
         "n_ok": n_success,
         "ood": args.ood,
         "problem": args.problem,
+        "geometry_mode": args.geometry_mode,
         "seed": args.seed,
         "max_mesh_retries": args.max_mesh_retries,
         "mesh_attempt_timeout_s": args.mesh_attempt_timeout_s,
@@ -806,6 +934,7 @@ def main() -> None:
             "device": args.device,
             "compile": bool(args.compile),
             "sample_mesh_params": args.sample_mesh_params,
+            "geometry_mode": args.geometry_mode,
             "base_mesh": {
                 "lnscale": args.lnscale,
                 "min_A": args.min_A,
