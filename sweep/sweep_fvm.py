@@ -36,7 +36,7 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Mapping, Tuple
 
 import numpy as np
 
@@ -44,40 +44,96 @@ import numpy as np
 # --------------------------------------------------------------------------
 # 1. The PDE-family sampler
 # --------------------------------------------------------------------------
-@dataclass
+@dataclass(frozen=True)
 class FamilySpec:
-    """Defines the parameter ranges for the in-distribution and OOD families.
+    """Controlled physical/PDE parameter family for one sweep split."""
 
-    The OOD ranges are deliberately disjoint from the in-distribution ones
-    on the parameters most likely to change the qualitative dynamics
-    (gamma, viscosity, inflow speed). Other parameters share the same
-    range to isolate which axis of variation matters.
-    """
-    gamma: Tuple[float, float] = (1.20, 1.45)
-    viscosity: Tuple[float, float] = (5e-4, 5e-3)
-    visc_bulk: Tuple[float, float] = (1e-3, 2e-2)
-    thermal_cond: Tuple[float, float] = (1e-7, 1e-5)
-    C_v: Tuple[float, float] = (1.5, 3.5)
-    T_0: Tuple[float, float] = (80.0, 120.0)
-    rho_inf: Tuple[float, float] = (0.8, 1.2)
-    T_inf: Tuple[float, float] = (80.0, 120.0)
-    v_n_inf: Tuple[float, float] = (3.0, 8.0)
-    ood_gamma: Tuple[float, float] = (1.45, 1.65)
-    ood_viscosity: Tuple[float, float] = (5e-3, 1e-2)
-    ood_v_n_inf: Tuple[float, float] = (8.0, 12.0)
+    name: str
+    description: str
+    physical: Mapping[str, Tuple[float, float]]
+    mesh: Mapping[str, Tuple[float, float]]
 
-    def sample(self, rng: np.random.Generator, ood: bool = False) -> Dict:
-        return dict(
-            gamma=float(rng.uniform(*(self.ood_gamma if ood else self.gamma))),
-            viscosity=float(rng.uniform(*(self.ood_viscosity if ood else self.viscosity))),
-            visc_bulk=float(rng.uniform(*self.visc_bulk)),
-            thermal_cond=float(rng.uniform(*self.thermal_cond)),
-            C_v=float(rng.uniform(*self.C_v)),
-            T_0=float(rng.uniform(*self.T_0)),
-            rho_inf=float(rng.uniform(*self.rho_inf)),
-            T_inf=float(rng.uniform(*self.T_inf)),
-            v_n_inf=float(rng.uniform(*(self.ood_v_n_inf if ood else self.v_n_inf))),
-        )
+    def sample_physics(self, rng: np.random.Generator) -> Dict:
+        return {k: float(rng.uniform(*v)) for k, v in self.physical.items()}
+
+    def sample_mesh(self, rng: np.random.Generator) -> Dict:
+        return {k: float(rng.uniform(*v)) for k, v in self.mesh.items()}
+
+
+FAMILY_SPECS: Dict[str, FamilySpec] = {
+    "id": FamilySpec(
+        name="id",
+        description=(
+            "In-distribution ideal-gas compressible Navier-Stokes family. "
+            "Ranges are narrow enough for stable smoke/CSD3 sweeps while still "
+            "varying gas constants, transport coefficients, and inlet state."
+        ),
+        physical={
+            "gamma": (1.22, 1.36),
+            "viscosity": (8e-4, 3e-3),
+            "visc_bulk": (2e-3, 1.2e-2),
+            "thermal_cond": (5e-7, 5e-6),
+            "C_v": (1.8, 2.8),
+            "T_0": (90.0, 110.0),
+            "rho_inf": (0.9, 1.1),
+            "T_inf": (90.0, 110.0),
+            "v_n_inf": (4.0, 7.0),
+        },
+        mesh={
+            "lnscale": (4.0, 6.0),
+            "min_A": (0.02, 0.04),
+            "max_A": (0.04, 0.08),
+        },
+    ),
+    "ood_mild": FamilySpec(
+        name="ood_mild",
+        description=(
+            "Mild OOD family adjacent to ID: slightly higher gamma, viscosity, "
+            "thermal conductivity, and inflow speed without pushing far into "
+            "known unstable regimes."
+        ),
+        physical={
+            "gamma": (1.36, 1.45),
+            "viscosity": (3e-3, 5e-3),
+            "visc_bulk": (8e-3, 2e-2),
+            "thermal_cond": (4e-6, 9e-6),
+            "C_v": (1.6, 3.0),
+            "T_0": (85.0, 115.0),
+            "rho_inf": (0.85, 1.15),
+            "T_inf": (85.0, 115.0),
+            "v_n_inf": (7.0, 8.5),
+        },
+        mesh={
+            "lnscale": (4.0, 6.5),
+            "min_A": (0.02, 0.05),
+            "max_A": (0.04, 0.10),
+        },
+    ),
+    "ood_hard": FamilySpec(
+        name="ood_hard",
+        description=(
+            "Harder OOD family for evaluation, not the first training target: "
+            "larger gas-constant and transport shifts plus faster inflow. "
+            "Use more retries and validation filtering."
+        ),
+        physical={
+            "gamma": (1.45, 1.58),
+            "viscosity": (5e-3, 8e-3),
+            "visc_bulk": (1.5e-2, 3e-2),
+            "thermal_cond": (8e-6, 1.5e-5),
+            "C_v": (1.4, 3.2),
+            "T_0": (80.0, 125.0),
+            "rho_inf": (0.8, 1.2),
+            "T_inf": (80.0, 125.0),
+            "v_n_inf": (8.5, 10.0),
+        },
+        mesh={
+            "lnscale": (4.5, 7.0),
+            "min_A": (0.03, 0.06),
+            "max_A": (0.06, 0.12),
+        },
+    ),
+}
 
 
 # --------------------------------------------------------------------------
@@ -97,7 +153,7 @@ sys.path.insert(0, os.path.join(REPO_ROOT, 'time_fvm'))
 
 
 KEY_STATUS_FIELDS = (
-    "sim_id", "seed", "problem", "lnscale", "min_A", "max_A",
+    "sim_id", "seed", "mesh_seed", "family", "problem", "lnscale", "min_A", "max_A",
     "gamma", "viscosity", "visc_bulk", "thermal_cond", "C_v",
     "T_0", "rho_inf", "T_inf", "v_n_inf",
 )
@@ -117,7 +173,8 @@ def _count_snapshots(out_dir):
                 if p.name.startswith("t_") and p.name.endswith(".npz")])
 
 
-def _status_record(params, status, failed_stage=None, reason=None, snapshots_saved=None):
+def _status_record(params, status, failed_stage=None, invalid_stage=None,
+                   reason=None, snapshots_saved=None, validation=None):
     record = {
         "status": status,
         "timestamp": _now(),
@@ -128,17 +185,25 @@ def _status_record(params, status, failed_stage=None, reason=None, snapshots_sav
             record[key] = params[key]
     if failed_stage:
         record["failed_stage"] = failed_stage
+    if invalid_stage:
+        record["invalid_stage"] = invalid_stage
     if reason:
         record["reason"] = reason
     if snapshots_saved is not None:
         record["number_of_snapshots_saved"] = int(snapshots_saved)
+    if validation is not None:
+        record["validation"] = validation
     return record
 
 
-def _write_status(params, status, failed_stage=None, reason=None, snapshots_saved=None):
+def _write_status(params, status, failed_stage=None, invalid_stage=None,
+                  reason=None, snapshots_saved=None, validation=None):
     out_dir = Path(params["out_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
-    record = _status_record(params, status, failed_stage, reason, snapshots_saved)
+    record = _status_record(
+        params, status, failed_stage, invalid_stage, reason,
+        snapshots_saved, validation,
+    )
     (out_dir / "status.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
     return record
 
@@ -178,6 +243,82 @@ def _mesh_failure_reason(exc):
     if "timeout" in text.lower():
         return "mesh generation timeout"
     return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+
+
+def _snapshot_files(out_dir):
+    out_path = Path(out_dir)
+    files = sorted(p for p in out_path.iterdir()
+                   if p.name.startswith("t_") and p.name.endswith(".npz"))
+    files.sort(key=lambda p: float(p.name[len("t_"):-len(".npz")]))
+    return files
+
+
+def _load_primitives(path):
+    z = np.load(path)
+    mean = z["prim_mean"].astype(np.float32)
+    std = z["prim_std"].astype(np.float32)
+    cells = z["cell_primatives"].astype(np.float32) * std + mean
+    return cells
+
+
+def _validate_saved_snapshots(params):
+    files = _snapshot_files(params["out_dir"])
+    validation = {
+        "number_of_snapshots_saved": len(files),
+        "min_snapshots_required": int(params.get("min_snapshots", 1)),
+        "validate_physics": bool(params.get("validate_physics", True)),
+    }
+    if len(files) < validation["min_snapshots_required"]:
+        return False, "snapshot_validation", (
+            f"only {len(files)} snapshots saved; "
+            f"minimum is {validation['min_snapshots_required']}"
+        ), validation
+
+    if not params.get("validate_physics", True):
+        return True, None, None, validation
+
+    rho_min = float(params.get("rho_min", 1e-9))
+    T_min = float(params.get("T_min", 1e-9))
+    max_abs_value = float(params.get("max_abs_value", 1e6))
+    validation.update({
+        "rho_min": rho_min,
+        "T_min": T_min,
+        "max_abs_value": max_abs_value,
+        "rho_observed_min": None,
+        "T_observed_min": None,
+        "max_abs_observed": None,
+    })
+
+    rho_obs = []
+    T_obs = []
+    abs_obs = []
+    for path in files:
+        cells = _load_primitives(path)
+        if not np.all(np.isfinite(cells)):
+            validation["bad_file"] = path.name
+            return False, "snapshot_validation", f"non-finite values in {path.name}", validation
+        rho = cells[:, 2]
+        T = cells[:, 3]
+        rho_obs.append(float(np.min(rho)))
+        T_obs.append(float(np.min(T)))
+        abs_obs.append(float(np.max(np.abs(cells))))
+
+    validation["rho_observed_min"] = float(np.min(rho_obs))
+    validation["T_observed_min"] = float(np.min(T_obs))
+    validation["max_abs_observed"] = float(np.max(abs_obs))
+    if validation["rho_observed_min"] <= rho_min:
+        return False, "snapshot_validation", (
+            f"density below lower bound: {validation['rho_observed_min']:.4g} <= {rho_min:.4g}"
+        ), validation
+    if validation["T_observed_min"] <= T_min:
+        return False, "snapshot_validation", (
+            f"temperature below lower bound: {validation['T_observed_min']:.4g} <= {T_min:.4g}"
+        ), validation
+    if validation["max_abs_observed"] > max_abs_value:
+        return False, "snapshot_validation", (
+            f"value explosion: max abs {validation['max_abs_observed']:.4g} > {max_abs_value:.4g}"
+        ), validation
+    return True, None, None, validation
 
 
 def _run():
@@ -222,7 +363,7 @@ def _run():
 
         for attempt in range(1, max_mesh_retries + 1):
             stage = "mesh_generation"
-            retry_seed = int(params["seed"]) + attempt - 1
+            retry_seed = int(params.get("mesh_seed", params["seed"])) + attempt - 1
             coarsen = 1.5 ** (attempt - 1)
             np.random.seed(retry_seed)
             torch.manual_seed(retry_seed)
@@ -296,20 +437,21 @@ def _run():
 
         snapshots = _count_snapshots(params["out_dir"])
         _log("snapshot_saving_summary", f"snapshots_saved={snapshots}")
-        if snapshots <= 0:
-            reason = "no snapshots saved"
+        valid, invalid_stage, reason, validation = _validate_saved_snapshots(params)
+        if not valid:
             _write_status(
                 params,
-                "failed",
-                failed_stage="snapshot_saving",
+                "invalid",
+                invalid_stage=invalid_stage,
                 reason=reason,
-                snapshots_saved=0,
+                snapshots_saved=snapshots,
+                validation=validation,
             )
-            _log("final_simulation_status", f"failed stage=snapshot_saving reason={reason}")
-            print("SIM_FAILED", params["out_dir"], flush=True)
+            _log("final_simulation_status", f"invalid stage={invalid_stage} reason={reason}")
+            print("SIM_INVALID", params["out_dir"], flush=True)
             return 3
 
-        _write_status(params, "success", snapshots_saved=snapshots)
+        _write_status(params, "success", snapshots_saved=snapshots, validation=validation)
         _log("final_simulation_status", "success")
         print('SIM_DONE', params['out_dir'], flush=True)
         return 0
@@ -341,6 +483,7 @@ if __name__ == '__main__':
 
 
 MANIFEST_PARAM_KEYS = (
+    "family", "mesh_seed",
     "gamma", "viscosity", "visc_bulk", "thermal_cond", "C_v",
     "T_0", "rho_inf", "T_inf", "v_n_inf", "lnscale", "min_A", "max_A",
 )
@@ -373,6 +516,8 @@ def _write_status(out_dir: Path, params: Dict, status: str, *,
         "output_folder": str(out_dir),
         "sim_id": params.get("sim_id"),
         "seed": params.get("seed"),
+        "mesh_seed": params.get("mesh_seed"),
+        "family": params.get("family"),
         "problem": params.get("problem"),
         "lnscale": params.get("lnscale"),
         "min_A": params.get("min_A"),
@@ -423,9 +568,14 @@ def _manifest_record(params: Dict, out_dir: Path, status_record: Dict,
     for key in MANIFEST_PARAM_KEYS:
         rec[key] = params.get(key)
     if "reason" in status_record:
-        rec["failure_reason"] = status_record["reason"]
+        if status_record.get("status") == "invalid":
+            rec["invalid_reason"] = status_record["reason"]
+        else:
+            rec["failure_reason"] = status_record["reason"]
     if "failed_stage" in status_record:
         rec["failed_stage"] = status_record["failed_stage"]
+    if "invalid_stage" in status_record:
+        rec["invalid_stage"] = status_record["invalid_stage"]
     if "number_of_snapshots_saved" in status_record:
         rec["number_of_snapshots_saved"] = status_record["number_of_snapshots_saved"]
     if elapsed_s is not None:
@@ -526,7 +676,9 @@ def main() -> None:
     ap.add_argument("--out", required=True, help="output directory")
     ap.add_argument("--n", type=int, default=8)
     ap.add_argument("--ood", action="store_true",
-                    help="sample from the held-out OOD parameter ranges")
+                    help="backward-compatible alias for --family ood_mild")
+    ap.add_argument("--family", choices=sorted(FAMILY_SPECS), default="id",
+                    help="controlled parameter family to sample")
     ap.add_argument("--problem", choices=["ellipse", "nozzle"], default="ellipse")
     ap.add_argument("--seed", type=int, default=12345)
     ap.add_argument("--n-iter", type=int, default=2500)
@@ -543,7 +695,22 @@ def main() -> None:
                     help="full mesh-generation attempts per simulation")
     ap.add_argument("--mesh-attempt-timeout-s", type=float, default=10,
                     help="timeout for each mesh worker attempt")
+    ap.add_argument("--sample-mesh-params", action="store_true",
+                    help="sample lnscale/min_A/max_A from the selected family")
+    ap.add_argument("--min-snapshots", type=int, default=1,
+                    help="minimum saved snapshots required for a usable simulation")
+    ap.add_argument("--validate-physics", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="validate finite values and positive rho/T before marking success")
+    ap.add_argument("--rho-min", type=float, default=1e-9,
+                    help="strict lower bound for density during validation")
+    ap.add_argument("--T-min", type=float, default=1e-9,
+                    help="strict lower bound for temperature during validation")
+    ap.add_argument("--max-abs-value", type=float, default=1e6,
+                    help="upper bound for absolute primitive values during validation")
     args = ap.parse_args()
+
+    family_name = "ood_mild" if args.ood and args.family == "id" else args.family
 
     repo = Path(args.repo).resolve()
     out_root = Path(args.out).resolve()
@@ -558,46 +725,105 @@ def main() -> None:
     except ImportError:
         print("WARNING: scripts/patch_fvm_solver.py not found - skipping patch.", flush=True)
 
-    family = FamilySpec()
+    family = FAMILY_SPECS[family_name]
     rng = np.random.default_rng(args.seed)
 
-    print(f"Sweep: n={args.n}  ood={args.ood}  problem={args.problem}", flush=True)
+    print(
+        f"Sweep: n={args.n}  family={family.name}  ood_flag={args.ood}  problem={args.problem}",
+        flush=True,
+    )
     print(f"Repo : {repo}\nOut  : {out_root}", flush=True)
 
-    n_ok = 0
+    n_success = 0
+    n_failed = 0
+    n_invalid = 0
     sim_records = []
     for i in range(args.n):
-        physics = family.sample(rng, ood=args.ood)
+        physics = family.sample_physics(rng)
+        mesh_params = (
+            family.sample_mesh(rng)
+            if args.sample_mesh_params
+            else {"lnscale": args.lnscale, "min_A": args.min_A, "max_A": args.max_A}
+        )
+        sim_seed = int(args.seed + 1000 * (10 if family.name != "id" else 1) + i)
+        mesh_seed = sim_seed
         params = {
             "sim_id": i,
-            "seed": int(args.seed + 1000 * (10 if args.ood else 1) + i),
+            "seed": sim_seed,
+            "mesh_seed": mesh_seed,
+            "family": family.name,
             "problem": args.problem,
             "device": args.device,
             "compile": bool(args.compile),
             "dt": args.dt, "n_iter": args.n_iter, "end_t": args.end_t,
             "save_t": args.save_t, "print_i": max(50, args.n_iter // 10),
-            "lnscale": args.lnscale, "min_A": args.min_A, "max_A": args.max_A,
+            "lnscale": mesh_params["lnscale"],
+            "min_A": mesh_params["min_A"],
+            "max_A": mesh_params["max_A"],
             "out_dir": str(out_root / f"sim_{i:04d}"),
             "timeout_s": args.timeout_s,
             "max_mesh_retries": args.max_mesh_retries,
             "mesh_attempt_timeout_s": args.mesh_attempt_timeout_s,
+            "min_snapshots": args.min_snapshots,
+            "validate_physics": args.validate_physics,
+            "rho_min": args.rho_min,
+            "T_min": args.T_min,
+            "max_abs_value": args.max_abs_value,
             **physics,
         }
         sim_record = run_one_sim(repo, Path(params["out_dir"]), params)
         sim_records.append(sim_record)
         if sim_record["status"] == "success":
-            n_ok += 1
+            n_success += 1
+        elif sim_record["status"] == "invalid":
+            n_invalid += 1
+        else:
+            n_failed += 1
 
     manifest = {
-        "n_sims": args.n, "n_ok": n_ok, "n_failed": args.n - n_ok, "ood": args.ood,
-        "problem": args.problem, "seed": args.seed,
-        "family_spec": asdict(family), "out_root": str(out_root),
+        "out_root": str(out_root),
+        "created_at": _utc_now(),
+        "family": family.name,
+        "family_spec": asdict(family),
+        "number_requested": args.n,
+        "n_sims": args.n,
+        "n_success": n_success,
+        "n_failed": n_failed,
+        "n_invalid": n_invalid,
+        "n_usable": n_success,
+        "n_ok": n_success,
+        "ood": args.ood,
+        "problem": args.problem,
+        "seed": args.seed,
         "max_mesh_retries": args.max_mesh_retries,
         "mesh_attempt_timeout_s": args.mesh_attempt_timeout_s,
+        "timeout_s": args.timeout_s,
+        "global_settings": {
+            "dt": args.dt,
+            "n_iter": args.n_iter,
+            "save_t": args.save_t,
+            "end_t": args.end_t,
+            "device": args.device,
+            "compile": bool(args.compile),
+            "sample_mesh_params": args.sample_mesh_params,
+            "base_mesh": {
+                "lnscale": args.lnscale,
+                "min_A": args.min_A,
+                "max_A": args.max_A,
+            },
+            "min_snapshots": args.min_snapshots,
+            "validate_physics": args.validate_physics,
+            "rho_min": args.rho_min,
+            "T_min": args.T_min,
+            "max_abs_value": args.max_abs_value,
+        },
         "simulations": sim_records,
     }
     (out_root / "MANIFEST.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    print(f"\nDone: {n_ok}/{args.n} simulations succeeded.", flush=True)
+    print(
+        f"\nDone: success={n_success} failed={n_failed} invalid={n_invalid} requested={args.n}.",
+        flush=True,
+    )
     print(f"Manifest at {out_root / 'MANIFEST.json'}", flush=True)
 
 

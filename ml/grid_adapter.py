@@ -14,17 +14,27 @@ de-normalise here before interpolating.
 
 Output of :func:`assemble_dataset` for a sweep folder is a single
 ``.npz`` per sim with the interpolated tensor of shape
-``(T, 4, H, W)`` plus a ``pde_vec`` fingerprint for diagnostics.
+``(T, 4, H, W)``, time stamps, channel names, metadata, and a ``pde_vec``
+fingerprint for diagnostics.
 """
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
+
+
+CHANNEL_NAMES = ["V_x", "V_y", "rho", "T"]
+PHYSICAL_KEYS = [
+    "gamma", "viscosity", "visc_bulk", "thermal_cond", "C_v",
+    "T_0", "rho_inf", "T_inf", "v_n_inf",
+]
+MESH_KEYS = ["lnscale", "min_A", "max_A", "mesh_seed"]
+TIME_KEYS = ["dt", "save_t", "n_iter", "end_t"]
 
 
 # --------------------------------------------------------------------------
@@ -77,6 +87,10 @@ class GridInterpolator:
 
         xs = np.linspace(bbox[0], bbox[2], grid_W)
         ys = np.linspace(bbox[1], bbox[3], grid_H)
+        self.x_coords = xs.astype(np.float32)
+        self.y_coords = ys.astype(np.float32)
+        self.dx = float(xs[1] - xs[0]) if grid_W > 1 else 1.0
+        self.dy = float(ys[1] - ys[0]) if grid_H > 1 else 1.0
         X, Y = np.meshgrid(xs, ys, indexing="xy")           # (H, W)
         self.grid_xy = np.stack([X.ravel(), Y.ravel()], axis=1)
         self.X, self.Y = X, Y
@@ -107,8 +121,53 @@ class GridInterpolator:
 # --------------------------------------------------------------------------
 # Sim-level conversion
 # --------------------------------------------------------------------------
+def _read_json(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+
+
+def _metadata(sim_dir: Path, cfg: Dict[str, Any], status: Dict[str, Any],
+              times: np.ndarray, interp: GridInterpolator) -> Dict[str, Any]:
+    """Build portable metadata for the packed grid file."""
+    physical = {k: status.get(k, cfg.get(k)) for k in PHYSICAL_KEYS}
+    mesh = {k: status.get(k, cfg.get(k)) for k in MESH_KEYS}
+    time_info = {k: cfg.get(k) for k in TIME_KEYS if k in cfg}
+    time_info["saved_times"] = [float(t) for t in times.tolist()]
+    return {
+        "sim_id": status.get("sim_id", cfg.get("sim_id", sim_dir.name)),
+        "seed": status.get("seed", cfg.get("seed")),
+        "family": status.get("family", cfg.get("family", "unknown")),
+        "problem": status.get("problem", cfg.get("problem")),
+        "status": status.get("status", "success"),
+        "failed_stage": status.get("failed_stage"),
+        "invalid_stage": status.get("invalid_stage"),
+        "reason": status.get("reason"),
+        "number_of_snapshots": int(len(times)),
+        "number_of_snapshots_saved": int(status.get("number_of_snapshots_saved", len(times))),
+        "physical_parameters": physical,
+        "mesh_parameters": mesh,
+        "time": time_info,
+        "channel_names": CHANNEL_NAMES,
+        "grid_shape": [int(interp.H), int(interp.W)],
+        "grid": {
+            "bbox": [float(v) for v in interp.bbox],
+            "dx": float(interp.dx),
+            "dy": float(interp.dy),
+            "x_min": float(interp.x_coords[0]),
+            "x_max": float(interp.x_coords[-1]),
+            "y_min": float(interp.y_coords[0]),
+            "y_max": float(interp.y_coords[-1]),
+        },
+        "source_dir": str(sim_dir),
+    }
+
+
 def convert_one_sim(sim_dir: Path, grid_H: int = 64, grid_W: int = 96
-                    ) -> Tuple[np.ndarray, np.ndarray, Dict]:
+                    ) -> Tuple[np.ndarray, np.ndarray, Dict, Dict, GridInterpolator]:
     """Convert all snapshots in ``sim_dir`` to a regular grid.
 
     Returns
@@ -116,6 +175,8 @@ def convert_one_sim(sim_dir: Path, grid_H: int = 64, grid_W: int = 96
     snaps : (T, 4, H, W) float32
     times : (T,)        float32
     cfg   : dict (the per-sim config that the sweep saved)
+    meta  : dict (portable metadata for downstream ML/evaluation)
+    interp: GridInterpolator with grid coordinates/spacing
     """
     mesh = load_mesh(sim_dir / "mesh_props.npz")
     interp = GridInterpolator(mesh["centroids"], grid_H=grid_H, grid_W=grid_W)
@@ -132,9 +193,11 @@ def convert_one_sim(sim_dir: Path, grid_H: int = 64, grid_W: int = 96
         snaps.append(grid)
         times.append(t)
 
-    cfg_path = sim_dir / "config.json"
-    cfg = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
-    return np.stack(snaps, axis=0), np.array(times, dtype=np.float32), cfg
+    cfg = _read_json(sim_dir / "config.json")
+    status = _read_json(sim_dir / "status.json")
+    times_arr = np.array(times, dtype=np.float32)
+    meta = _metadata(sim_dir, cfg, status, times_arr, interp)
+    return np.stack(snaps, axis=0), times_arr, cfg, meta, interp
 
 
 def pde_fingerprint(cfg: Dict) -> np.ndarray:
@@ -169,7 +232,7 @@ def simulation_skip_reason(sim_dir: Path) -> str | None:
         except json.JSONDecodeError as exc:
             return f"invalid status.json ({exc})"
         if status.get("status") != "success":
-            failed_stage = status.get("failed_stage", "unknown")
+            failed_stage = status.get("failed_stage") or status.get("invalid_stage", "unknown")
             reason = status.get("reason", "no reason recorded")
             return f"status={status.get('status')} failed_stage={failed_stage} reason={reason}"
 
@@ -197,26 +260,41 @@ def assemble_dataset(sweep_dir: str | Path, out_dir: str | Path,
     sim_dirs = sorted(p for p in sweep_dir.iterdir()
                       if p.is_dir() and p.name.startswith("sim_"))
     saved: List[str] = []
+    skipped: Dict[str, int] = {}
     for sd in sim_dirs:
         skip_reason = simulation_skip_reason(sd)
         if skip_reason is not None:
+            skipped[skip_reason] = skipped.get(skip_reason, 0) + 1
             print(f"  SKIP {sd.name}: {skip_reason}")
             continue
-        snaps, times, cfg = convert_one_sim(sd, grid_H=grid_H, grid_W=grid_W)
+        snaps, times, cfg, meta, interp = convert_one_sim(sd, grid_H=grid_H, grid_W=grid_W)
         if not np.all(np.isfinite(snaps)):
-            print(f"  SKIP {sd.name}: non-finite values after interp")
+            skip_reason = "non-finite values after interp"
+            skipped[skip_reason] = skipped.get(skip_reason, 0) + 1
+            print(f"  SKIP {sd.name}: {skip_reason}")
             continue
         out_path = out_dir / f"{sd.name}.npz"
         np.savez_compressed(
             out_path,
+            states=snaps.astype(np.float32),
             snapshots=snaps.astype(np.float32),
             times=times,
+            channel_names=np.array(CHANNEL_NAMES),
+            x_coords=interp.x_coords,
+            y_coords=interp.y_coords,
+            dx=np.float32(interp.dx),
+            dy=np.float32(interp.dy),
+            bbox=np.array(interp.bbox, dtype=np.float32),
+            metadata_json=json.dumps(meta),
             pde_vec=pde_fingerprint(cfg),
             cfg_json=json.dumps(cfg),
         )
         saved.append(str(out_path))
         print(f"  WRITE {out_path.name}: snaps={snaps.shape}  "
               f"gamma={cfg.get('gamma', 0):.2f}  mu={cfg.get('viscosity', 0):.1e}")
+    print(f"\nGrid adapter summary: converted={len(saved)} skipped={sum(skipped.values())}")
+    for reason, count in sorted(skipped.items(), key=lambda item: (-item[1], item[0])):
+        print(f"  skipped {count}: {reason}")
     if not saved:
         raise RuntimeError(
             f"No successful simulations found in {sweep_dir}. "

@@ -47,13 +47,25 @@ Thumbs.db
 logs/
 *.log
 
+# Evaluation / generated figures
+eval/
+figures/predictions/
+figures/generated/
+
 # Local model checkpoints / training outputs
 checkpoints/
+*.pt
+*.pth
 
 # Local CFD/FVM generated test datasets
+datasets/raw_*/
+datasets/grid_*/
+datasets/family_pilot/
 datasets/family_test*/
 datasets/grid_test*/
 datasets/smoke_robust/
+datasets/local_*/
+datasets/smoke_*/
 datasets/_codex_*/
 
 # Large generated datasets

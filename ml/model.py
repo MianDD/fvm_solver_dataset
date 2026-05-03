@@ -41,7 +41,7 @@ Architecture
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 import torch.nn as nn
@@ -156,30 +156,38 @@ class ChannelNormaliser(nn.Module):
 # The model
 # --------------------------------------------------------------------------
 class FoundationCFDModel(nn.Module):
-    """Predicts s_{t+1} - s_t for each t in a context of states s_{0..tau-1}.
+    """Predict update fields for CFD states.
 
-    To roll out, call :meth:`rollout` which appends each prediction to the
-    context and continues autoregressively.
+    ``n_input_channels`` can be larger than ``n_target_channels`` when
+    derivative features are concatenated to the physical input channels.
+    The model always predicts updates for the target physical channels only.
     """
 
     def __init__(self, n_channels: int = 4, H: int = 48, W: int = 72,
+                 n_input_channels: int | None = None,
+                 n_target_channels: int | None = None,
                  patch_size: int = 8, d_model: int = 128, n_heads: int = 4,
-                 n_layers: int = 4, max_context: int = 8, dropout: float = 0.0):
+                 n_layers: int = 4, max_context: int = 8, dropout: float = 0.0,
+                 mlp_ratio: float = 4.0):
         super().__init__()
         assert H % patch_size == 0 and W % patch_size == 0, \
             f"H={H}, W={W} must be divisible by patch_size={patch_size}"
-        self.C = n_channels; self.H = H; self.W = W; self.P = patch_size
+        self.C_in = int(n_input_channels or n_channels)
+        self.C = int(n_target_channels or n_channels)
+        self.H = H; self.W = W; self.P = patch_size
         self.n_x = H // patch_size
         self.n_y = W // patch_size
         self.N = self.n_x * self.n_y
         self.d_model = d_model
         self.max_context = max_context
+        self.mlp_ratio = mlp_ratio
 
-        self.normaliser = ChannelNormaliser(n_channels)
+        self.normaliser = ChannelNormaliser(self.C_in)
 
-        patch_dim = n_channels * patch_size * patch_size
+        patch_dim_in = self.C_in * patch_size * patch_size
+        patch_dim_out = self.C * patch_size * patch_size
         self.patch_encoder = nn.Sequential(
-            nn.Linear(patch_dim, d_model), nn.GELU(),
+            nn.Linear(patch_dim_in, d_model), nn.GELU(),
             nn.Linear(d_model, d_model),
         )
         self.spatiotemporal = SpatiotemporalEmbedding(
@@ -188,23 +196,24 @@ class FoundationCFDModel(nn.Module):
         )
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=n_heads,
-            dim_feedforward=4 * d_model, dropout=dropout,
+            dim_feedforward=int(mlp_ratio * d_model), dropout=dropout,
             batch_first=True, activation="gelu", norm_first=True,
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
         self.patch_decoder = nn.Sequential(
             nn.Linear(d_model, d_model), nn.GELU(),
-            nn.Linear(d_model, patch_dim),
+            nn.Linear(d_model, patch_dim_out),
         )
         # Lightweight CNN refinement smooths patch boundaries
         self.refine = nn.Sequential(
-            nn.Conv2d(n_channels, 32, 3, padding=1), nn.GELU(),
+            nn.Conv2d(self.C, 32, 3, padding=1), nn.GELU(),
             nn.Conv2d(32, 32, 3, padding=1),         nn.GELU(),
-            nn.Conv2d(32, n_channels, 3, padding=1),
+            nn.Conv2d(32, self.C, 3, padding=1),
         )
 
     def encode_context(self, states: torch.Tensor) -> torch.Tensor:
         B, tau, C, H, W = states.shape
+        assert C == self.C_in, f"Expected {self.C_in} input channels, got {C}"
         x = states.reshape(B * tau, C, H, W)
         tokens = to_patches(x, self.P)                  # (B*tau, N, C*P*P)
         tokens = self.patch_encoder(tokens)              # (B*tau, N, d)
@@ -218,10 +227,15 @@ class FoundationCFDModel(nn.Module):
         j_step = torch.arange(S, device=device) // self.N
         return j_step.unsqueeze(0) > i_step.unsqueeze(1)
 
-    def forward(self, states: torch.Tensor, normalised: bool = False
-                ) -> torch.Tensor:
+    def predict_update(self, states: torch.Tensor, normalised: bool = False
+                       ) -> torch.Tensor:
+        """Return model-predicted delta or dX/dt fields.
+
+        The interpretation is chosen by the caller via ``prediction_mode``.
+        Shape: ``(B, tau, n_target_channels, H, W)``.
+        """
         if not normalised:
-            x = self.normaliser.normalise(states.reshape(-1, self.C, self.H, self.W))
+            x = self.normaliser.normalise(states.reshape(-1, self.C_in, self.H, self.W))
             states_n = x.reshape(*states.shape)
         else:
             states_n = states
@@ -234,25 +248,76 @@ class FoundationCFDModel(nn.Module):
 
         flat = out.reshape(B * tau, self.N, self.d_model)
         patches = self.patch_decoder(flat)
-        delta = from_patches(patches, C, H, W, self.P)
+        delta = from_patches(patches, self.C, H, W, self.P)
         delta = delta + self.refine(delta)
-        delta = delta.reshape(B, tau, C, H, W)
+        return delta.reshape(B, tau, self.C, H, W)
 
-        pred_next_n = states_n + delta
-        if not normalised:
-            return self.normaliser.denormalise(
-                pred_next_n.reshape(-1, C, H, W)).reshape(B, tau, C, H, W)
-        return pred_next_n
+    @staticmethod
+    def integrate_update(current_state: torch.Tensor, update: torch.Tensor,
+                         prediction_mode: str = "delta",
+                         integrator: str = "euler",
+                         dt: torch.Tensor | float | None = None) -> torch.Tensor:
+        """Convert a predicted update field into a next state."""
+        if prediction_mode == "delta":
+            return current_state + update
+        if prediction_mode != "derivative":
+            raise ValueError(f"Unknown prediction_mode: {prediction_mode}")
+        if integrator != "euler":
+            raise ValueError(f"Unsupported integrator: {integrator}")
+        if dt is None:
+            scale = torch.as_tensor(1.0, dtype=update.dtype, device=update.device)
+        elif isinstance(dt, torch.Tensor):
+            scale = dt.to(dtype=update.dtype, device=update.device)
+        else:
+            scale = torch.as_tensor(float(dt), dtype=update.dtype, device=update.device)
+        if scale.dim() == 1:
+            scale = scale.view(scale.shape[0], *([1] * (update.dim() - 1)))
+        return current_state + scale * update
+
+    def forward(self, states: torch.Tensor, normalised: bool = False,
+                prediction_mode: str = "delta", integrator: str = "euler",
+                dt: torch.Tensor | float | None = None,
+                current_state: torch.Tensor | None = None,
+                return_update: bool = False) -> torch.Tensor:
+        update = self.predict_update(states, normalised=normalised)
+        if return_update:
+            return update
+        if current_state is None:
+            if states.shape[2] < self.C:
+                raise ValueError("current_state is required when inputs do not contain target channels")
+            current_state = states[:, :, :self.C]
+        return self.integrate_update(
+            current_state,
+            update,
+            prediction_mode=prediction_mode,
+            integrator=integrator,
+            dt=dt,
+        )
 
     @torch.no_grad()
-    def rollout(self, context: torch.Tensor, n_steps: int) -> torch.Tensor:
-        """context: (B, tau0, C, H, W) -> predictions: (B, n_steps, C, H, W)."""
+    def rollout(self, context: torch.Tensor, n_steps: int,
+                prediction_mode: str = "delta", integrator: str = "euler",
+                dt: torch.Tensor | float | None = None) -> torch.Tensor:
+        """context: (B, tau0, C, H, W) -> predictions: (B, n_steps, C, H, W).
+
+        This convenience method is for plain physical-channel contexts.  For
+        derivative-feature checkpoints, use the evaluation code path that
+        rebuilds derivative input features after each autoregressive step.
+        """
         self.eval()
         states = context
         preds = []
         for _ in range(n_steps):
-            out = self(states[:, -self.max_context:], normalised=False)
-            next_state = out[:, -1:]
+            context_in = states[:, -self.max_context:]
+            update = self.predict_update(context_in, normalised=False)[:, -1]
+            current = context_in[:, -1, :self.C]
+            next_state = self.integrate_update(
+                current,
+                update,
+                prediction_mode=prediction_mode,
+                integrator=integrator,
+                dt=dt,
+            ).unsqueeze(1)
             preds.append(next_state)
             states = torch.cat([states, next_state], dim=1)
         return torch.cat(preds, dim=1)

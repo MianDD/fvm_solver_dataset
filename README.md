@@ -1,78 +1,102 @@
-# `fvm_solver_dataset` — varying-PDE dataset generation and foundation-model training
+# fvm_solver_dataset
 
-This repository extends [`Maxzhu123/fvm_solver`](https://github.com/Maxzhu123/fvm_solver) (the supervisor's compressible-Navier–Stokes finite-volume solver) into a **foundation-model pipeline for fluid simulations**: it sweeps a *family* of PDE configurations through the solver, packs the resulting unstructured snapshots onto regular grids, and trains a patch-transformer that predicts future fluid states from a context history.
+This repository extends a compressible Navier-Stokes finite-volume solver into
+a research pipeline for CFD/FVM dataset generation and Transformer surrogate
+modelling.
 
-The motivation, following the project brief, is that an ML surrogate trained on a *single* fixed PDE cannot generalise to fluids with non-ideal Newtonian behaviour, different gas constants, or different transport coefficients — but a model trained across a *family* of PDEs can use its observed history to identify the dynamics in-context (in the spirit of TabPFN, Poseidon, Walrus and TNT).
+The project has two deliberately separate pipelines:
 
-## Repository layout
+- Pipeline A, raw dataset generation: sample physical parameters, generate a
+  mesh, run the FVM solver, save unstructured snapshots, validate quality, and
+  write metadata.
+- Pipeline B, ML surrogate modelling: consume saved datasets, skip failed or
+  invalid runs, convert successful simulations to grid tensors, train/evaluate
+  a Transformer, and plot predictions.
 
+The FVM equations, fluxes, integrators, and physical model live in `time_fvm/`.
+The current ML upgrades do not modify that numerical solver logic.
+
+## Repository Layout
+
+```text
+base_cfg.py                Base paths/configuration
+mesh_gen/                  Mesh generation utilities
+time_fvm/                  Finite-volume solver, physics, BCs, saver
+sweep/sweep_fvm.py         Robust raw simulation sweep runner
+sweep/summarize_dataset.py Dataset status/parameter summary tool
+ml/grid_adapter.py         Unstructured snapshots to regular-grid tensors
+ml/dataset.py              Sliding-window dataset with optional derivatives
+ml/model.py                Patch Transformer surrogate
+ml/train.py                Training entry point
+ml/evaluate.py             One-step and rollout evaluation
+ml/plot_predictions.py     Prediction/error plots
+docs/workflow.md           End-to-end local and CSD3 workflow
+scripts/                   CSD3 Slurm templates
 ```
-.                              
-├── base_cfg.py                     paths
-├── mesh_gen/                       meshpy + custom triangulation
-├── time_fvm/                       FVM equations, integrators, BCs, saver
-├── requirements.txt
-.                              -- new code added by this project:
-├── scripts/
-│   └── patch_fvm_solver.py         one-time compatibility fix (Python 3.10+)
-├── sweep/
-│   ├── sweep_fvm.py                runs the solver many times with sampled physics
-│   └── __init__.py
-├── ml/
-│   ├── grid_adapter.py             unstructured snapshots --> regular grids
-│   ├── model.py                    patch transformer w/ spatiotemporal embeddings
-│   ├── dataset.py                  PyTorch Dataset over the regular-grid .npz
-│   ├── train.py                    teacher-forced autoregressive training
-│   └── __init__.py
-├── docs/                           theory and design notes (Reports 1 & 2)
-└── figures/                        plots produced by training and evaluation
-```
+
+## Output Layout
+
+Generated artifacts should stay outside source directories:
+
+- raw simulations: `datasets/raw_*`
+- gridded tensors: `datasets/grid_*`
+- checkpoints: `checkpoints/*`
+- evaluation results: `eval/*`
+- prediction figures: `figures/predictions/*`
+
+These paths are ignored by Git.
 
 ## Quickstart
 
-```bash
-# 1. Set up environment
-git clone https://github.com/MianDD/fvm_solver_dataset.git
-cd fvm_solver_dataset
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-pip install scipy                                         # used by ml/grid_adapter.py
+Set up the environment:
 
-# 2. One-off: fix forward-reference bug in supervisor's code (Python 3.10+)
-python scripts/patch_fvm_solver.py
-
-# 3. Generate a family of CFD simulations (~30 min on CPU; one process per sim)
-python -m sweep.sweep_fvm --out datasets/family_v1 --n 24
-python -m sweep.sweep_fvm --out datasets/ood       --n  6 --ood
-
-# 4. Pack onto regular grids for the ML model
-python -m ml.grid_adapter --sweep datasets/family_v1 --out datasets/grid_main --H 64 --W 96
-python -m ml.grid_adapter --sweep datasets/ood       --out datasets/grid_ood  --H 64 --W 96
-
-# 5. Train (CPU, ~10 min for the small config)
-python -m ml.train --grid datasets/grid_main --out checkpoints/run0 \
-                   --epochs 25 --batch 4 --d-model 128 --patch 8
+```powershell
+cd C:\Users\Lenovo\Desktop\fvm_solver_dataset
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-## Pipeline at a glance
+Run a small end-to-end CPU smoke test:
 
+```powershell
+.\.venv\Scripts\python.exe -m sweep.sweep_fvm --out datasets\raw_local_smoke `
+  --n 2 --family id --device cpu --n-iter 20 --save-t 0.001 --dt 5e-4 `
+  --min-A 0.1 --max-A 0.2 --lnscale 4 --min-snapshots 2
+
+.\.venv\Scripts\python.exe -m sweep.summarize_dataset --sweep datasets\raw_local_smoke --write-json
+
+.\.venv\Scripts\python.exe -m ml.grid_adapter --sweep datasets\raw_local_smoke --out datasets\grid_local_smoke --H 64 --W 96
+
+.\.venv\Scripts\python.exe -m ml.train --grid datasets\grid_local_smoke --out checkpoints\local_delta `
+  --epochs 2 --batch 1 --context 4 --horizon 1 --device cpu `
+  --d-model 64 --heads 4 --layers 2 --patch 8
+
+.\.venv\Scripts\python.exe -m ml.evaluate --grid datasets\grid_local_smoke `
+  --ckpt checkpoints\local_delta\best_model.pt --out eval\local_delta --device cpu --batch 1
+
+.\.venv\Scripts\python.exe -m ml.plot_predictions --grid datasets\grid_local_smoke `
+  --ckpt checkpoints\local_delta\best_model.pt --out figures\predictions\local_delta --device cpu
 ```
-ConfigEllipse  --PDE family-->  sweep_fvm.py  --N independent runs-->
-   datasets/family_v1/sim_NNNN/{mesh_props.npz, t_*.npz, config.json}
-   --grid_adapter--> datasets/grid_main/sim_NNNN.npz  (T, 4, H, W)
-   --train.py-->     checkpoints/run0/model.pt
+
+## GPhyT-Inspired ML Options
+
+The model can optionally use derivative features as input and predict a
+time-derivative update that is integrated by Forward Euler:
+
+```powershell
+.\.venv\Scripts\python.exe -m ml.train --grid datasets\grid_local_smoke --out checkpoints\local_derivative `
+  --epochs 2 --batch 1 --context 4 --horizon 1 --device cpu `
+  --d-model 64 --heads 4 --layers 2 --patch 8 `
+  --prediction-mode derivative --integrator euler `
+  --use-derivatives --derivative-mode central --strides 1,2
 ```
 
-Each step is independent — you can re-run the sweep with different parameter ranges, or re-pack at a different resolution, without re-training.
+Derivative input channels are `[original, dx, dy, dt]` for each physical
+channel. Spatial derivatives use physical `dx` and `dy` saved by
+`ml.grid_adapter`; old grid files without spacing metadata fall back to index
+spacing with a warning. Targets remain `[V_x, V_y, rho, T]`.
 
-## What the foundation-model formulation looks like
+`--horizon` is currently fixed to `1`. Multi-horizon training and evaluation
+are not implemented yet.
 
-The brief asks us to formalise CFD prediction the way TabPFN formalises tabular classification. Loosely: we draw a PDE θ ~ p(θ) (here, ranges over γ, μ, μ_b, k, C_v, ...), draw an initial state s_0, simulate forward to get a trajectory s_{0:T}, and at inference time the model is given a partial trajectory s_{0:τ} and predicts s_{τ+1:T}. Implicit Bayesian marginalisation over θ, conditioned on the observed history, is exactly what an attention mechanism approximates when it is trained over many trajectories with different θ.
-
-## Reproducibility
-
-All sweep parameters are saved in `sim_NNNN/config.json`; the seed is logged in the run's `MANIFEST.json`. Every training run dumps its full config and per-epoch loss to `checkpoints/run0/`.
-
-## Acknowledgements
-
-Solver and dataset-saving code are by Max Zhu (project supervisor). Patch-transformer architecture follows the design space explored in TNT, Poseidon, Walrus and FLUID-LLM.
+For the complete workflow, including CSD3 templates, see
+[`docs/workflow.md`](docs/workflow.md).
