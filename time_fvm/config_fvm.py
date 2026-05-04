@@ -39,6 +39,8 @@ class ConfigFVM(ABC):
     # Physical parameters, to be overwritten
     T_0: float = None        # Reference temperature
     viscosity: float = None     # At reference temp
+    viscosity_law: str = "sutherland"  # {sutherland, constant, power_law}
+    power_law_n: float = 0.75
     visc_bulk: float = None
     thermal_cond: float = None
     S_const: float = None       # Sutherland's constant
@@ -109,6 +111,8 @@ class ConfigEllipse(ConfigFVM):
     # Physical parameters
     T_0: float = 100        # Reference temperature
     viscosity: float = 1e-3     # At reference temp
+    viscosity_law: str = "sutherland"
+    power_law_n: float = 0.75
     visc_bulk: float = 10e-3
     thermal_cond: float = 1e-6
     S_const: float = 110.4       # Sutherland's constant
@@ -164,6 +168,8 @@ class ConfigNozzle(ConfigFVM):
     # Physical parameters
     T_0: float = 100        # Reference temperature
     viscosity: float = 5e-3     # At reference temp
+    viscosity_law: str = "sutherland"
+    power_law_n: float = 0.75
     visc_bulk: float = 50e-5
     thermal_cond: float = 1e-6
     S_const: float = 110.4       # Sutherland's constant

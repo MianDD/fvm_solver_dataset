@@ -23,11 +23,15 @@ class PhysicalSetup:
 
         self.T_0 = cfg.T_0
         self.mu = cfg.viscosity
+        self.viscosity_law = getattr(cfg, "viscosity_law", "sutherland")
+        self.power_law_n = getattr(cfg, "power_law_n", 0.75)
         self.mu_b = cfg.visc_bulk
         self.S_const = cfg.S_const
         self.C_v = cfg.C_v
         self.gamma = cfg.gamma
         self.R = self.C_v * (cfg.gamma - 1)
+        if self.viscosity_law not in {"sutherland", "constant", "power_law"}:
+            raise ValueError(f"Unknown viscosity_law={self.viscosity_law!r}")
 
     def state_to_primative(self, state: torch.Tensor):
         """ Convert from conserved quantities (momentum, rho, energy) to primitives (velocity, rho, T) """
@@ -60,13 +64,22 @@ class PhysicalSetup:
         D, I1, I2 = self._strain_values(E_props)        # shape = [n_edges, 2, 2]
         I1 = I1.view(-1, 1, 1)   # [n_edges, 1, 1]. Trace of D.
 
-        # Viscosity = mu * (T/T0)^(3/2) * (T0 + S) / (T + S)
-        mu = self.mu * (T /  self.T_0)**1.5 * (self.T_0 + self.S_const) / (T + self.S_const)  # shape = [n_edges, edges=2, n_comp=1]
+        mu = self.shear_viscosity(T)  # shape = [n_edges, edges=2, n_comp=1]
         # Bulk viscosity: Proportional to T^2
         mu_b = self.mu_b * T ** 2 / self.T_0 ** 2
 
         eye = torch.eye(2, device=self.device)
         self.tau = -2 * mu * D - mu_b * I1 * eye  # shape = [n_edges, 2, 2]
+
+    def shear_viscosity(self, T: torch.Tensor) -> torch.Tensor:
+        """Dynamic shear viscosity for the selected constitutive law."""
+        if self.viscosity_law == "sutherland":
+            return self.mu * (T / self.T_0) ** 1.5 * (self.T_0 + self.S_const) / (T + self.S_const)
+        if self.viscosity_law == "constant":
+            return torch.ones_like(T) * self.mu
+        if self.viscosity_law == "power_law":
+            return self.mu * (T / self.T_0) ** self.power_law_n
+        raise ValueError(f"Unknown viscosity_law={self.viscosity_law!r}")
 
     def _strain_values(self, E_props: FVMEdgeInfo):
         """ Compute strain tensor:

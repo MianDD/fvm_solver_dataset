@@ -87,6 +87,7 @@ def _prediction_settings(ckpt: Dict, overrides: argparse.Namespace) -> Dict:
             if overrides.use_derivatives is not None
             else bool(_cfg_value(ckpt, "use_derivatives", False))
         ),
+        "use_mask_channel": bool(_cfg_value(ckpt, "use_mask_channel", False)),
         "derivative_mode": overrides.derivative_mode or _cfg_value(ckpt, "derivative_mode", "central"),
         "use_physical_derivatives": bool(_cfg_value(ckpt, "use_physical_derivatives", True)),
         "prediction_mode": overrides.prediction_mode or _cfg_value(ckpt, "prediction_mode", "delta"),
@@ -139,6 +140,8 @@ def _rollout_one_file(model, path: str | Path, context: int, steps: int,
             dy_spacing=rec["dy"],
             use_derivatives=settings["use_derivatives"],
             derivative_mode=settings["derivative_mode"],
+            mask=rec["mask"],
+            use_mask_channel=settings["use_mask_channel"],
         )
         features_t = torch.from_numpy(features).unsqueeze(0).to(device)
         current = torch.from_numpy(context_states[-1]).unsqueeze(0).to(device)
@@ -189,6 +192,7 @@ def evaluate(grid_dir: str | Path, ckpt_path: str | Path, out_dir: str | Path,
         strides=settings["strides"],
         use_derivatives=settings["use_derivatives"],
         derivative_mode=settings["derivative_mode"],
+        use_mask_channel=settings["use_mask_channel"],
     )
     if len(ds) == 0:
         raise RuntimeError("No evaluation windows. Reduce --context/--horizon/--strides or add snapshots.")

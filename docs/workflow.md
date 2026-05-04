@@ -49,6 +49,19 @@ nearby generalisation tests, and `--family ood_hard` for stress testing. Mesh
 sampling is separate from PDE/physics sampling; enable it with
 `--sample-mesh-params`.
 
+The default shear-viscosity law is the original `sutherland` model. To make a
+small constitutive-law variation dataset without changing the FVM fluxes or
+integrators, use:
+
+```powershell
+.\.venv\Scripts\python.exe -m sweep.sweep_fvm --out datasets\raw_powerlaw_smoke `
+  --n 2 --family ood_mild --geometry-mode fixed_ellipse --device cpu `
+  --viscosity-law power_law --power-law-n 0.75
+```
+
+Supported laws are `sutherland`, `constant`, and `power_law`. This is a first
+controlled constitutive-relation variation, not a generic PDE-template system.
+
 For CSD3 runs where random ellipse mesh generation is unstable, use
 `--geometry-mode fixed_ellipse`. This keeps one deterministic ellipse geometry
 and varies only the physical/PDE family parameters across simulations:
@@ -80,11 +93,15 @@ Each output `.npz` contains:
 - `states` and backward-compatible `snapshots`, shaped `(T, C, H, W)`
 - `times`, shaped `(T,)`
 - `channel_names`, currently `[V_x, V_y, rho, T]`
+- `mask`, shaped `(H, W)`, where `1` means fluid and `0` means solid/invalid
 - `x_coords`, `y_coords`, `dx`, `dy`, and `bbox` for physical derivative features
 - `metadata_json` with simulation id, seed, family, physical parameters, mesh
   parameters, time settings, validation status, and source folder
 - `cfg_json` for backward-compatible access to the raw simulation config
-- `pde_vec` for diagnostics
+- `pde_vec` and `pde_vec_names` for physical-parameter diagnostics
+
+Old grid files without `mask` still load. The dataset class fills in an
+all-fluid mask, so baseline training remains backward-compatible.
 
 ## D. Train Transformer
 
@@ -110,6 +127,31 @@ GPhyT-inspired mode adds derivative input features and asks the model to predict
   --use-derivatives --derivative-mode central --strides 1,2
 ```
 
+Boundary-mask training appends the static fluid mask as an input channel and
+uses the same mask to exclude solid/invalid cells from the prediction loss:
+
+```powershell
+.\.venv\Scripts\python.exe -m ml.train --grid datasets\grid_local_smoke --out checkpoints\local_masked `
+  --epochs 2 --batch 1 --context 4 --horizon 1 --device cpu `
+  --d-model 64 --heads 4 --layers 2 --patch 8 `
+  --use-mask-channel --mask-loss
+```
+
+The optional PDE-identification auxiliary head predicts the saved `pde_vec`
+from pooled latent context tokens. It supports an implicit-PDE-identification
+experiment from temporal context without changing the main next-state target:
+
+```powershell
+.\.venv\Scripts\python.exe -m ml.train --grid datasets\grid_local_smoke --out checkpoints\local_pde_aux `
+  --epochs 2 --batch 1 --context 4 --horizon 1 --device cpu `
+  --d-model 64 --heads 4 --layers 2 --patch 8 `
+  --pde-aux-loss --pde-aux-weight 0.01
+```
+
+If `--pde-aux-loss` is explicitly requested and a grid file lacks `pde_vec`, the
+trainer raises a clear error. Baseline training without the flag still works on
+old datasets.
+
 The default attention path is the original flattened global Transformer:
 `--attention-type global`, so old commands and checkpoints remain compatible.
 For future ID20/ID200 experiments, `--attention-type factorized` is the main
@@ -131,6 +173,17 @@ To use factorized attention while keeping the same dataset and training loop:
   --attention-type factorized
 ```
 
+The default positional embedding is `--pos-encoding learned_absolute`, which is
+kept for old checkpoint compatibility. `--pos-encoding sinusoidal` is an
+optional parameter-free alternative:
+
+```powershell
+.\.venv\Scripts\python.exe -m ml.train --grid datasets\grid_local_smoke --out checkpoints\local_sinusoidal `
+  --epochs 1 --batch 1 --context 4 --horizon 1 --device cpu `
+  --d-model 64 --heads 4 --layers 2 --patch 8 `
+  --pos-encoding sinusoidal
+```
+
 Training-only input noise can be used as a small rollout-stability regularizer.
 The default `--input-noise-std 0.0` keeps deterministic baseline behavior.
 Values such as `0.005` or `0.01` add Gaussian noise to the input context scaled
@@ -148,6 +201,13 @@ applied during validation, evaluation, or plotting.
 tubelets are the next architecture step because they require changing both
 tokenisation and detokenisation; this pass keeps the stable spatial patch
 decoder.
+
+Scope note: the current solver remains an ideal-gas compressible
+Navier-Stokes-family generator. It now includes scalar parameter variation,
+fixed/random geometry choices, and an initial shear-viscosity-law switch, but it
+is not yet a fully generic PDE registry. The temporal context window is an
+implicit PDE-identification mechanism, not a direct TabPFN-style in-context
+learning system.
 
 Training output contains:
 

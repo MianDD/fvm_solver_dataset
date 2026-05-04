@@ -28,6 +28,7 @@ import torch.nn.functional as F
 
 
 ATTENTION_TYPES = ("global", "factorized")
+POSITION_ENCODINGS = ("learned_absolute", "sinusoidal")
 
 
 # --------------------------------------------------------------------------
@@ -65,17 +66,41 @@ def from_patches(tokens: torch.Tensor, C: int, H: int, W: int, P: int
 # Spatiotemporal embedding
 # --------------------------------------------------------------------------
 class SpatiotemporalEmbedding(nn.Module):
-    """Adds learnable (x, y, t) embeddings to a sequence of patch tokens."""
+    """Adds learnable or sinusoidal (x, y, t) embeddings to patch tokens."""
 
-    def __init__(self, max_x: int, max_y: int, max_t: int, d_model: int):
+    def __init__(self, max_x: int, max_y: int, max_t: int, d_model: int,
+                 mode: str = "learned_absolute"):
         super().__init__()
+        if mode not in POSITION_ENCODINGS:
+            allowed = ", ".join(repr(name) for name in POSITION_ENCODINGS)
+            raise ValueError(f"pos_encoding must be one of {allowed}; got {mode!r}.")
+        self.mode = mode
+        self.d_model = d_model
         d3 = d_model // 3
         self.dx = d3
         self.dy = d_model - 2 * d3   # remaining dims absorbed into y
         self.dt = d3
-        self.x_emb = nn.Embedding(max_x, self.dx)
-        self.y_emb = nn.Embedding(max_y, self.dy)
-        self.t_emb = nn.Embedding(max_t, self.dt)
+        if mode == "learned_absolute":
+            self.x_emb = nn.Embedding(max_x, self.dx)
+            self.y_emb = nn.Embedding(max_y, self.dy)
+            self.t_emb = nn.Embedding(max_t, self.dt)
+
+    @staticmethod
+    def _sinusoidal(indices: torch.Tensor, dim: int) -> torch.Tensor:
+        if dim <= 0:
+            return indices.new_zeros((indices.numel(), 0), dtype=torch.float32)
+        pos = indices.to(dtype=torch.float32).unsqueeze(1)
+        half = (dim + 1) // 2
+        freq = torch.exp(
+            torch.arange(half, device=indices.device, dtype=torch.float32)
+            * (-torch.log(torch.tensor(10000.0, device=indices.device)) / max(half, 1))
+        )
+        angles = pos * freq.unsqueeze(0)
+        enc = torch.zeros(indices.numel(), dim, device=indices.device, dtype=torch.float32)
+        enc[:, 0::2] = torch.sin(angles[:, :enc[:, 0::2].shape[1]])
+        if dim > 1:
+            enc[:, 1::2] = torch.cos(angles[:, :enc[:, 1::2].shape[1]])
+        return enc
 
     def forward(self, tokens: torch.Tensor, n_x: int, n_y: int) -> torch.Tensor:
         B, tau, N, d = tokens.shape
@@ -85,9 +110,16 @@ class SpatiotemporalEmbedding(nn.Module):
         xs = torch.arange(n_x, device=device).repeat_interleave(n_y)
         ys = torch.arange(n_y, device=device).repeat(n_x)
         ts = torch.arange(tau, device=device)
-        ex = self.x_emb(xs)                                    # (N, dx)
-        ey = self.y_emb(ys)                                    # (N, dy)
-        et = self.t_emb(ts)                                    # (tau, dt)
+        if self.mode == "learned_absolute":
+            ex = self.x_emb(xs)                                # (N, dx)
+            ey = self.y_emb(ys)                                # (N, dy)
+            et = self.t_emb(ts)                                # (tau, dt)
+        else:
+            # Sinusoidal mode is parameter-free and can extrapolate to new
+            # context lengths or patch-grid sizes without learned table limits.
+            ex = self._sinusoidal(xs, self.dx)                 # (N, dx)
+            ey = self._sinusoidal(ys, self.dy)                 # (N, dy)
+            et = self._sinusoidal(ts, self.dt)                 # (tau, dt)
         spatial = torch.cat([ex, ey], dim=-1)                  # (N, dx+dy)
         spatial = spatial.unsqueeze(0).unsqueeze(0)            # (1,1,N,dx+dy)
         spatial = F.pad(spatial, (0, self.dt))                 # (1,1,N,d)
@@ -241,11 +273,16 @@ class FoundationCFDModel(nn.Module):
                  n_target_channels: int | None = None,
                  patch_size: int = 8, d_model: int = 128, n_heads: int = 4,
                  n_layers: int = 4, max_context: int = 8, dropout: float = 0.0,
-                 mlp_ratio: float = 4.0, attention_type: str = "global"):
+                 mlp_ratio: float = 4.0, attention_type: str = "global",
+                 pos_encoding: str = "learned_absolute",
+                 pde_dim: int = 0):
         super().__init__()
         if attention_type not in ATTENTION_TYPES:
             allowed = ", ".join(repr(name) for name in ATTENTION_TYPES)
             raise ValueError(f"attention_type must be one of {allowed}; got {attention_type!r}.")
+        if pos_encoding not in POSITION_ENCODINGS:
+            allowed = ", ".join(repr(name) for name in POSITION_ENCODINGS)
+            raise ValueError(f"pos_encoding must be one of {allowed}; got {pos_encoding!r}.")
         if patch_size <= 0:
             raise ValueError(f"patch_size must be positive; got {patch_size}.")
         if H % patch_size != 0 or W % patch_size != 0:
@@ -267,6 +304,8 @@ class FoundationCFDModel(nn.Module):
         self.max_context = max_context
         self.mlp_ratio = mlp_ratio
         self.attention_type = attention_type
+        self.pos_encoding = pos_encoding
+        self.pde_dim = int(pde_dim or 0)
 
         self.normaliser = ChannelNormaliser(self.C_in)
 
@@ -279,6 +318,7 @@ class FoundationCFDModel(nn.Module):
         self.spatiotemporal = SpatiotemporalEmbedding(
             max_x=self.n_x, max_y=self.n_y,
             max_t=max_context, d_model=d_model,
+            mode=pos_encoding,
         )
         if attention_type == "global":
             encoder_layer = nn.TransformerEncoderLayer(
@@ -302,81 +342,110 @@ class FoundationCFDModel(nn.Module):
             nn.Conv2d(32, 32, 3, padding=1),         nn.GELU(),
             nn.Conv2d(32, self.C, 3, padding=1),
         )
+        self.pde_head = (
+            nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, self.pde_dim))
+            if self.pde_dim > 0 else None
+        )
 
     def encode_context_tokens(self, states: torch.Tensor) -> torch.Tensor:
         B, tau, C, H, W = states.shape
         if C != self.C_in:
             raise ValueError(f"Expected {self.C_in} input channels, got {C}.")
-        if (H, W) != (self.H, self.W):
-            raise ValueError(f"Expected grid shape H={self.H}, W={self.W}; got H={H}, W={W}.")
-        if tau > self.max_context:
+        if H % self.P != 0 or W % self.P != 0:
+            raise ValueError(
+                f"Grid shape H={H}, W={W} must be divisible by patch_size={self.P}."
+            )
+        n_x, n_y = H // self.P, W // self.P
+        if self.pos_encoding == "learned_absolute" and tau > self.max_context:
             raise ValueError(f"Context length {tau} exceeds max_context={self.max_context}.")
+        if self.pos_encoding == "learned_absolute" and (n_x > self.n_x or n_y > self.n_y):
+            raise ValueError(
+                "learned_absolute position encoding was initialised for patch grid "
+                f"{self.n_x}x{self.n_y}, got {n_x}x{n_y}. Use --pos-encoding sinusoidal "
+                "for parameter-free positional features."
+            )
         x = states.reshape(B * tau, C, H, W)
         tokens = to_patches(x, self.P)                  # (B*tau, N, C*P*P)
+        n_patches = tokens.shape[1]
         tokens = self.patch_encoder(tokens)              # (B*tau, N, d)
-        tokens = tokens.reshape(B, tau, self.N, self.d_model)  # (B, T, N, D)
-        tokens = self.spatiotemporal(tokens, self.n_x, self.n_y)
+        tokens = tokens.reshape(B, tau, n_patches, self.d_model)  # (B, T, N, D)
+        tokens = self.spatiotemporal(tokens, n_x, n_y)
         return tokens
 
     def encode_context(self, states: torch.Tensor) -> torch.Tensor:
         B, tau, _, _, _ = states.shape
         tokens = self.encode_context_tokens(states)
-        return tokens.reshape(B, tau * self.N, self.d_model)
+        n_patches = tokens.shape[2]
+        return tokens.reshape(B, tau * n_patches, self.d_model)
 
-    def _block_causal_mask(self, tau: int, device) -> torch.Tensor:
-        S = tau * self.N
-        i_step = torch.arange(S, device=device) // self.N
-        j_step = torch.arange(S, device=device) // self.N
+    def _block_causal_mask(self, tau: int, n_patches: int, device) -> torch.Tensor:
+        S = tau * n_patches
+        i_step = torch.arange(S, device=device) // n_patches
+        j_step = torch.arange(S, device=device) // n_patches
         return j_step.unsqueeze(0) > i_step.unsqueeze(1)
 
-    def predict_update(self, states: torch.Tensor, normalised: bool = False
-                       ) -> torch.Tensor:
-        """Return model-predicted delta or dX/dt fields.
-
-        The interpretation is chosen by the caller via ``prediction_mode``.
-        Global attention preserves the legacy return shape
-        ``(B, T, n_target_channels, H, W)`` by decoding every context step.
-        Factorized attention decodes only the final context step and returns
-        ``(B, 1, n_target_channels, H, W)``. Training/evaluation callers use
-        ``[:, -1]`` in both cases, so the one-step prediction target is the
-        same semantic object: final context-step spatial tokens.
-        """
+    def _encoded_tokens(self, states: torch.Tensor, normalised: bool = False
+                        ) -> tuple[torch.Tensor, int, int, int, int, int, int]:
         if states.dim() != 5:
             raise ValueError(f"Expected states with shape (B, T, C, H, W); got {tuple(states.shape)}.")
         B, tau, C, H, W = states.shape
         if C != self.C_in:
             raise ValueError(f"Expected {self.C_in} input channels, got {C}.")
-        if (H, W) != (self.H, self.W):
-            raise ValueError(f"Expected grid shape H={self.H}, W={self.W}; got H={H}, W={W}.")
-        if tau > self.max_context:
+        if H % self.P != 0 or W % self.P != 0:
+            raise ValueError(
+                f"Grid shape H={H}, W={W} must be divisible by patch_size={self.P}."
+            )
+        if self.pos_encoding == "learned_absolute" and tau > self.max_context:
             raise ValueError(f"Context length {tau} exceeds max_context={self.max_context}.")
         if not normalised:
-            x = self.normaliser.normalise(states.reshape(-1, self.C_in, self.H, self.W))
+            x = self.normaliser.normalise(states.reshape(-1, self.C_in, H, W))
             states_n = x.reshape(*states.shape)
         else:
             states_n = states
 
         tokens_structured = self.encode_context_tokens(states_n)  # (B, T, N, D)
+        n_patches = tokens_structured.shape[2]
         if self.attention_type == "global":
             # Legacy baseline path: flatten time and space into one block-causal
             # sequence, then decode all T context steps for checkpoint/repro
             # compatibility. Downstream code selects the final slice with [:, -1].
-            tokens = tokens_structured.reshape(B, tau * self.N, self.d_model)
-            mask = self._block_causal_mask(tau, tokens.device)
+            tokens = tokens_structured.reshape(B, tau * n_patches, self.d_model)
+            mask = self._block_causal_mask(tau, n_patches, tokens.device)
             out = self.transformer(tokens, mask=mask)
-            out = out.reshape(B, tau, self.N, self.d_model)
-            flat = out.reshape(B * tau, self.N, self.d_model)
-            out_tau = tau
+            out = out.reshape(B, tau, n_patches, self.d_model)
         else:
             # Experimental path: keep tokens structured as (B, T, N, D), use
-            # factorized spatial/temporal attention, and decode final-step tokens.
+            # factorized spatial/temporal attention.
             out = self.factorized_encoder(tokens_structured)
-            flat = out[:, -1].reshape(B, self.N, self.d_model)
+        return out, B, tau, H, W, C, n_patches
+
+    def predict_update_and_pde(self, states: torch.Tensor, normalised: bool = False
+                               ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Return predicted update fields and optional PDE-parameter logits.
+
+        The update interpretation is chosen by the caller via
+        ``prediction_mode``. Global attention preserves the legacy update shape
+        ``(B, T, C, H, W)`` by decoding every context step. Factorized attention
+        decodes only the final context step and returns ``(B, 1, C, H, W)``.
+        """
+        out, B, tau, H, W, _, n_patches = self._encoded_tokens(states, normalised=normalised)
+        if self.attention_type == "global":
+            flat = out.reshape(B * tau, n_patches, self.d_model)
+            out_tau = tau
+        else:
+            flat = out[:, -1].reshape(B, n_patches, self.d_model)
             out_tau = 1
         patches = self.patch_decoder(flat)
         delta = from_patches(patches, self.C, H, W, self.P)
         delta = delta + self.refine(delta)
-        return delta.reshape(B, out_tau, self.C, H, W)
+        update = delta.reshape(B, out_tau, self.C, H, W)
+        pde_pred = self.pde_head(out.mean(dim=(1, 2))) if self.pde_head is not None else None
+        return update, pde_pred
+
+    def predict_update(self, states: torch.Tensor, normalised: bool = False
+                       ) -> torch.Tensor:
+        update, _ = self.predict_update_and_pde(states, normalised=normalised)
+        return update
 
     @staticmethod
     def integrate_update(current_state: torch.Tensor, update: torch.Tensor,

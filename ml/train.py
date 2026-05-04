@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 from .dataset import (
     CFDWindowDataset,
     TARGET_CHANNEL_NAMES,
-    derivative_channel_names,
+    input_channel_names,
     parse_strides,
     split_paths,
 )
@@ -47,6 +47,12 @@ class TrainConfig:
     mlp_ratio: float = 4.0
     attention_type: str = "global"
     input_noise_std: float = 0.0
+    pos_encoding: str = "learned_absolute"
+    use_mask_channel: bool = False
+    mask_loss: bool = False
+    pde_aux_loss: bool = False
+    pde_aux_weight: float = 0.01
+    pde_dim: int = 0
     num_workers: int = 0
     save_every: int = 0
     resume: str | None = None
@@ -65,6 +71,23 @@ def weighted_mse(pred: torch.Tensor, true: torch.Tensor,
     return (w * (pred - true) ** 2).mean()
 
 
+def weighted_masked_mse(pred: torch.Tensor, true: torch.Tensor,
+                        mask: torch.Tensor | None = None,
+                        weights: Tuple[float, ...] = (1.0, 1.0, 1.0, 1.0)) -> torch.Tensor:
+    w = torch.as_tensor(weights, dtype=pred.dtype, device=pred.device)
+    w = w.view(*([1] * (pred.dim() - 3)), -1, 1, 1)
+    err = w * (pred - true) ** 2
+    if mask is None:
+        return err.mean()
+    mask = mask.to(dtype=pred.dtype, device=pred.device)
+    if mask.dim() == 3:
+        mask = mask.unsqueeze(1)
+    if mask.dim() != 4:
+        raise ValueError(f"mask must have shape (B,H,W) or (B,1,H,W), got {tuple(mask.shape)}")
+    denom = mask.sum() * pred.shape[1]
+    return (err * mask).sum() / denom.clamp_min(1.0)
+
+
 def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -73,10 +96,11 @@ def set_seed(seed: int) -> None:
 
 
 def _input_channel_names(use_derivatives: bool) -> List[str]:
-    return (
-        derivative_channel_names(TARGET_CHANNEL_NAMES)
-        if use_derivatives else list(TARGET_CHANNEL_NAMES)
-    )
+    return input_channel_names(use_derivatives, False, TARGET_CHANNEL_NAMES)
+
+
+def _configured_input_channel_names(cfg: TrainConfig) -> List[str]:
+    return input_channel_names(cfg.use_derivatives, cfg.use_mask_channel, TARGET_CHANNEL_NAMES)
 
 
 def compute_channel_stats(loader: DataLoader, n_channels: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -116,6 +140,8 @@ def make_model(cfg: TrainConfig, C_in: int, H: int, W: int) -> FoundationCFDMode
         dropout=cfg.dropout,
         mlp_ratio=cfg.mlp_ratio,
         attention_type=cfg.attention_type,
+        pos_encoding=cfg.pos_encoding,
+        pde_dim=cfg.pde_dim if cfg.pde_aux_loss else 0,
     )
 
 
@@ -135,13 +161,19 @@ def model_config_dict(cfg: TrainConfig, C_in: int, H: int, W: int) -> Dict:
         "dropout": cfg.dropout,
         "mlp_ratio": cfg.mlp_ratio,
         "attention_type": cfg.attention_type,
-        "input_channel_names": _input_channel_names(cfg.use_derivatives),
+        "pos_encoding": cfg.pos_encoding,
+        "input_channel_names": _configured_input_channel_names(cfg),
         "target_channel_names": TARGET_CHANNEL_NAMES,
         "use_derivatives": cfg.use_derivatives,
+        "use_mask_channel": cfg.use_mask_channel,
+        "mask_loss": cfg.mask_loss,
         "derivative_mode": cfg.derivative_mode,
         "use_physical_derivatives": cfg.use_physical_derivatives,
         "prediction_mode": cfg.prediction_mode,
         "integrator": cfg.integrator,
+        "pde_aux_loss": cfg.pde_aux_loss,
+        "pde_aux_weight": cfg.pde_aux_weight,
+        "pde_dim": cfg.pde_dim if cfg.pde_aux_loss else 0,
         "strides": parse_strides(cfg.strides),
     }
 
@@ -212,7 +244,9 @@ def save_checkpoint(path: Path, model: FoundationCFDModel, optim, sched,
 
 
 def predict_next(model: FoundationCFDModel, batch: Dict, cfg: TrainConfig,
-                 device: str, training: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+                 device: str, training: bool = False) -> Tuple[
+                     torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None
+                 ]:
     features = batch["input_states"].to(device)
     current = batch["context_states"][:, -1].to(device)
     target = batch["target_states"][:, 0].to(device)
@@ -222,8 +256,12 @@ def predict_next(model: FoundationCFDModel, batch: Dict, cfg: TrainConfig,
             dtype=features.dtype,
             device=features.device,
         )
+        if cfg.use_mask_channel:
+            channel_scale = channel_scale.clone()
+            channel_scale[:, :, -1:] = 0.0
         features = features + cfg.input_noise_std * channel_scale * torch.randn_like(features)
-    update = model.predict_update(features, normalised=False)[:, -1]
+    update, pred_pde = model.predict_update_and_pde(features, normalised=False)
+    update = update[:, -1]
     pred_next = model.integrate_update(
         current,
         update,
@@ -231,7 +269,8 @@ def predict_next(model: FoundationCFDModel, batch: Dict, cfg: TrainConfig,
         integrator=cfg.integrator,
         dt=dt,
     )
-    return pred_next, target
+    true_pde = batch["pde_vec"].to(device) if cfg.pde_aux_loss else None
+    return pred_next, target, pred_pde, true_pde
 
 
 def train(cfg: TrainConfig, device: str | None = None) -> Dict:
@@ -239,6 +278,8 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         raise ValueError(HORIZON_ERROR)
     if cfg.input_noise_std < 0.0:
         raise ValueError("--input-noise-std must be non-negative.")
+    if cfg.pde_aux_weight < 0.0:
+        raise ValueError("--pde-aux-weight must be non-negative.")
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     out_dir = Path(cfg.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -258,6 +299,7 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         strides=cfg.strides,
         use_derivatives=cfg.use_derivatives,
         derivative_mode=cfg.derivative_mode,
+        use_mask_channel=cfg.use_mask_channel,
     )
     val_ds = CFDWindowDataset(
         val_paths,
@@ -266,10 +308,29 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         strides=cfg.strides,
         use_derivatives=cfg.use_derivatives,
         derivative_mode=cfg.derivative_mode,
+        use_mask_channel=cfg.use_mask_channel,
     )
     if len(train_ds) == 0 or len(val_ds) == 0:
         raise RuntimeError("No train/val windows. Reduce --context/--horizon/--strides or add snapshots.")
     print(f"#train windows = {len(train_ds)}   #val windows = {len(val_ds)}")
+    if cfg.mask_loss and not (train_ds.has_masks and val_ds.has_masks):
+        print("WARNING: mask loss requested but one or more grid files lack masks; missing masks use all-fluid defaults.")
+    if cfg.use_mask_channel and not (train_ds.has_masks and val_ds.has_masks):
+        print("WARNING: mask channel requested but one or more grid files lack masks; missing masks use all-fluid defaults.")
+    if cfg.pde_aux_loss:
+        if not (train_ds.has_pde_vec and val_ds.has_pde_vec):
+            raise RuntimeError("--pde-aux-loss requested but at least one grid file is missing pde_vec.")
+        inferred_pde_dim = int(train_ds.pde_dim)
+        if inferred_pde_dim <= 0 or val_ds.pde_dim != inferred_pde_dim:
+            raise RuntimeError(
+                "--pde-aux-loss requested but pde_vec lengths are missing or inconsistent "
+                "between train/validation grid files."
+            )
+        if cfg.pde_dim <= 0:
+            cfg.pde_dim = inferred_pde_dim
+        if cfg.pde_dim != inferred_pde_dim:
+            raise RuntimeError(f"--pde-dim={cfg.pde_dim} does not match dataset pde_vec length {inferred_pde_dim}.")
+        save_json(out_dir / "train_config.json", dc.asdict(cfg))
     physical_spacing_used = bool(
         cfg.use_derivatives and train_ds.uses_physical_spacing and val_ds.uses_physical_spacing
     )
@@ -294,6 +355,14 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
     print(
         f"Prediction mode: {cfg.prediction_mode}  integrator: {cfg.integrator}  "
         f"strides={cfg.strides}  attention={cfg.attention_type}"
+    )
+    print(
+        f"Mask channel: {'enabled' if cfg.use_mask_channel else 'disabled'}  "
+        f"mask loss: {'enabled' if cfg.mask_loss else 'disabled'}"
+    )
+    print(
+        f"PDE aux loss: {'enabled' if cfg.pde_aux_loss else 'disabled'}"
+        + (f"  pde_dim={cfg.pde_dim} weight={cfg.pde_aux_weight:g}" if cfg.pde_aux_loss else "")
     )
     print(f"Input noise std: {cfg.input_noise_std:g} normalizer-std units (training only)")
     attention_complexity = attention_complexity_dict(cfg, H, W)
@@ -327,6 +396,10 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
     history: Dict[str, List] = {
         "train_loss": [],
         "val_loss": [],
+        "train_pred_loss": [],
+        "val_pred_loss": [],
+        "train_pde_loss": [],
+        "val_pde_loss": [],
         "epoch_time": [],
         "lr": [],
     }
@@ -348,36 +421,69 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         t0 = time.time()
         model.train()
         running = 0.0
+        running_pred = 0.0
+        running_pde = 0.0
         n_batches = 0
         for batch in train_loader:
-            pred, tgt = predict_next(model, batch, cfg, device, training=True)
-            loss = weighted_mse(pred, tgt)
+            pred, tgt, pred_pde, true_pde = predict_next(model, batch, cfg, device, training=True)
+            mask = batch["target_mask"].to(device) if cfg.mask_loss else None
+            pred_loss = weighted_masked_mse(pred, tgt, mask=mask)
+            if cfg.pde_aux_loss:
+                pde_loss = torch.mean((pred_pde - true_pde) ** 2)
+                loss = pred_loss + cfg.pde_aux_weight * pde_loss
+            else:
+                pde_loss = torch.zeros((), dtype=pred_loss.dtype, device=pred_loss.device)
+                loss = pred_loss
             optim.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optim.step()
             sched.step()
             running += loss.item()
+            running_pred += pred_loss.item()
+            running_pde += pde_loss.item()
             n_batches += 1
         train_loss = running / max(1, n_batches)
+        train_pred_loss = running_pred / max(1, n_batches)
+        train_pde_loss = running_pde / max(1, n_batches)
 
         model.eval()
         with torch.no_grad():
             val_running = 0.0
+            val_pred_running = 0.0
+            val_pde_running = 0.0
             val_batches = 0
             for batch in val_loader:
-                pred, tgt = predict_next(model, batch, cfg, device)
-                val_running += weighted_mse(pred, tgt).item()
+                pred, tgt, pred_pde, true_pde = predict_next(model, batch, cfg, device)
+                mask = batch["target_mask"].to(device) if cfg.mask_loss else None
+                pred_loss = weighted_masked_mse(pred, tgt, mask=mask)
+                if cfg.pde_aux_loss:
+                    pde_loss = torch.mean((pred_pde - true_pde) ** 2)
+                    loss = pred_loss + cfg.pde_aux_weight * pde_loss
+                else:
+                    pde_loss = torch.zeros((), dtype=pred_loss.dtype, device=pred_loss.device)
+                    loss = pred_loss
+                val_running += loss.item()
+                val_pred_running += pred_loss.item()
+                val_pde_running += pde_loss.item()
                 val_batches += 1
             val_loss = val_running / max(1, val_batches)
+            val_pred_loss = val_pred_running / max(1, val_batches)
+            val_pde_loss = val_pde_running / max(1, val_batches)
 
         epoch_time = time.time() - t0
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
+        history["train_pred_loss"].append(train_pred_loss)
+        history["val_pred_loss"].append(val_pred_loss)
+        history["train_pde_loss"].append(train_pde_loss)
+        history["val_pde_loss"].append(val_pde_loss)
         history["epoch_time"].append(epoch_time)
         history["lr"].append(float(optim.param_groups[0]["lr"]))
         print(
             f"[ep {epoch:3d}] train={train_loss:.4e} val={val_loss:.4e} "
+            f"pred={train_pred_loss:.4e}/{val_pred_loss:.4e} "
+            f"pde={train_pde_loss:.4e}/{val_pde_loss:.4e} "
             f"lr={history['lr'][-1]:.3e} t={epoch_time:.1f}s"
         )
 
@@ -407,6 +513,10 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         "best_val_loss": best_val,
         "final_train_loss": history["train_loss"][-1],
         "final_val_loss": history["val_loss"][-1],
+        "final_train_pred_loss": history["train_pred_loss"][-1],
+        "final_val_pred_loss": history["val_pred_loss"][-1],
+        "final_train_pde_loss": history["train_pde_loss"][-1],
+        "final_val_pde_loss": history["val_pde_loss"][-1],
         "n_train_sims": len(train_paths),
         "n_val_sims": len(val_paths),
         "n_train_windows": len(train_ds),
@@ -415,11 +525,16 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         "prediction_mode": cfg.prediction_mode,
         "integrator": cfg.integrator,
         "use_derivatives": cfg.use_derivatives,
+        "use_mask_channel": cfg.use_mask_channel,
+        "mask_loss": cfg.mask_loss,
         "use_physical_derivatives": cfg.use_physical_derivatives,
         "physical_derivative_spacing": model_cfg["physical_derivative_spacing"],
         "attention_type": cfg.attention_type,
         "attention_complexity": attention_complexity,
         "input_noise_std": cfg.input_noise_std,
+        "pde_aux_loss": cfg.pde_aux_loss,
+        "pde_aux_weight": cfg.pde_aux_weight,
+        "pde_dim": cfg.pde_dim if cfg.pde_aux_loss else 0,
         "strides": parse_strides(cfg.strides),
     }
     save_json(out_dir / "metrics.json", metrics)
@@ -459,8 +574,19 @@ def main() -> None:
     ap.add_argument("--dropout", type=float, default=0.0)
     ap.add_argument("--mlp-ratio", type=float, default=4.0)
     ap.add_argument("--attention-type", choices=["global", "factorized"], default="global")
+    ap.add_argument("--pos-encoding", choices=["learned_absolute", "sinusoidal"],
+                    default="learned_absolute")
     ap.add_argument("--input-noise-std", type=float, default=0.0,
                     help="training-only Gaussian input noise in model-normalizer std units")
+    ap.add_argument("--use-mask-channel", action="store_true",
+                    help="append the static fluid mask as an input channel")
+    ap.add_argument("--mask-loss", action="store_true",
+                    help="compute prediction loss only over fluid-mask cells")
+    ap.add_argument("--pde-aux-loss", action="store_true",
+                    help="enable auxiliary pde_vec identification loss")
+    ap.add_argument("--pde-aux-weight", type=float, default=0.01)
+    ap.add_argument("--pde-dim", type=int, default=0,
+                    help="PDE auxiliary output dimension; inferred from pde_vec when 0")
     ap.add_argument("--use-derivatives", dest="use_derivatives", action="store_true")
     ap.add_argument("--no-derivatives", dest="use_derivatives", action="store_false")
     ap.set_defaults(use_derivatives=False)
@@ -473,6 +599,8 @@ def main() -> None:
         ap.error(HORIZON_ERROR)
     if args.input_noise_std < 0.0:
         ap.error("--input-noise-std must be non-negative.")
+    if args.pde_aux_weight < 0.0:
+        ap.error("--pde-aux-weight must be non-negative.")
 
     cfg = TrainConfig(
         grid_dir=args.grid,
@@ -496,7 +624,13 @@ def main() -> None:
         dropout=args.dropout,
         mlp_ratio=args.mlp_ratio,
         attention_type=args.attention_type,
+        pos_encoding=args.pos_encoding,
         input_noise_std=args.input_noise_std,
+        use_mask_channel=args.use_mask_channel,
+        mask_loss=args.mask_loss,
+        pde_aux_loss=args.pde_aux_loss,
+        pde_aux_weight=args.pde_aux_weight,
+        pde_dim=args.pde_dim,
         use_derivatives=args.use_derivatives,
         derivative_mode=args.derivative_mode,
         use_physical_derivatives=True,

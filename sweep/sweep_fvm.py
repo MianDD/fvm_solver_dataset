@@ -52,9 +52,18 @@ class FamilySpec:
     description: str
     physical: Mapping[str, Tuple[float, float]]
     mesh: Mapping[str, Tuple[float, float]]
+    viscosity_laws: Tuple[str, ...] = ("sutherland",)
+    power_law_n: Tuple[float, float] = (0.6, 1.0)
 
     def sample_physics(self, rng: np.random.Generator) -> Dict:
-        return {k: float(rng.uniform(*v)) for k, v in self.physical.items()}
+        params = {k: float(rng.uniform(*v)) for k, v in self.physical.items()}
+        law = str(rng.choice(self.viscosity_laws))
+        params["viscosity_law"] = law
+        params["power_law_n"] = (
+            float(rng.uniform(*self.power_law_n))
+            if law == "power_law" else 0.75
+        )
+        return params
 
     def sample_mesh(self, rng: np.random.Generator) -> Dict:
         return {k: float(rng.uniform(*v)) for k, v in self.mesh.items()}
@@ -84,6 +93,7 @@ FAMILY_SPECS: Dict[str, FamilySpec] = {
             "min_A": (0.02, 0.04),
             "max_A": (0.04, 0.08),
         },
+        viscosity_laws=("sutherland",),
     ),
     "ood_mild": FamilySpec(
         name="ood_mild",
@@ -108,6 +118,8 @@ FAMILY_SPECS: Dict[str, FamilySpec] = {
             "min_A": (0.02, 0.05),
             "max_A": (0.04, 0.10),
         },
+        viscosity_laws=("sutherland", "constant", "power_law"),
+        power_law_n=(0.55, 0.95),
     ),
     "ood_hard": FamilySpec(
         name="ood_hard",
@@ -132,6 +144,8 @@ FAMILY_SPECS: Dict[str, FamilySpec] = {
             "min_A": (0.03, 0.06),
             "max_A": (0.06, 0.12),
         },
+        viscosity_laws=("constant", "power_law"),
+        power_law_n=(0.4, 1.2),
     ),
 }
 
@@ -156,7 +170,8 @@ KEY_STATUS_FIELDS = (
     "sim_id", "seed", "mesh_seed", "family", "problem", "geometry_mode",
     "fixed_geometry_spec",
     "lnscale", "min_A", "max_A",
-    "gamma", "viscosity", "visc_bulk", "thermal_cond", "C_v",
+    "gamma", "viscosity", "viscosity_law", "power_law_n",
+    "visc_bulk", "thermal_cond", "C_v",
     "T_0", "rho_inf", "T_inf", "v_n_inf",
 )
 
@@ -228,6 +243,8 @@ def _configure_cfg(cfg, params):
     # PDE physics
     cfg.gamma = params['gamma']
     cfg.viscosity = params['viscosity']
+    cfg.viscosity_law = params.get('viscosity_law', 'sutherland')
+    cfg.power_law_n = params.get('power_law_n', 0.75)
     cfg.visc_bulk = params['visc_bulk']
     cfg.thermal_cond = params['thermal_cond']
     cfg.C_v = params['C_v']
@@ -582,7 +599,8 @@ if __name__ == '__main__':
 
 MANIFEST_PARAM_KEYS = (
     "family", "geometry_mode", "fixed_geometry_spec", "mesh_seed",
-    "gamma", "viscosity", "visc_bulk", "thermal_cond", "C_v",
+    "gamma", "viscosity", "viscosity_law", "power_law_n",
+    "visc_bulk", "thermal_cond", "C_v",
     "T_0", "rho_inf", "T_inf", "v_n_inf", "lnscale", "min_A", "max_A",
 )
 
@@ -624,6 +642,8 @@ def _write_status(out_dir: Path, params: Dict, status: str, *,
         "max_A": params.get("max_A"),
         "gamma": params.get("gamma"),
         "viscosity": params.get("viscosity"),
+        "viscosity_law": params.get("viscosity_law"),
+        "power_law_n": params.get("power_law_n"),
         "visc_bulk": params.get("visc_bulk"),
         "thermal_cond": params.get("thermal_cond"),
         "C_v": params.get("C_v"),
@@ -758,6 +778,7 @@ def run_one_sim(repo_root: Path, out_dir: Path, params: Dict,
     print(
         f"  [{out_dir.name}] {'OK' if success else 'FAIL'} ({elapsed:.1f}s)  "
         f"gamma={params['gamma']:.2f}  mu={params['viscosity']:.2e}  "
+        f"law={params.get('viscosity_law', 'sutherland')}  "
         f"v={params['v_n_inf']:.1f}"
         + (f"  reason={reason}" if reason and not success else ""),
         flush=True,
@@ -779,6 +800,11 @@ def main() -> None:
                     help="backward-compatible alias for --family ood_mild")
     ap.add_argument("--family", choices=sorted(FAMILY_SPECS), default="id",
                     help="controlled parameter family to sample")
+    ap.add_argument("--viscosity-law", choices=["family", "sutherland", "constant", "power_law"],
+                    default="family",
+                    help="override the selected family's viscosity-law sampling")
+    ap.add_argument("--power-law-n", type=float, default=None,
+                    help="override the power-law viscosity exponent when viscosity_law=power_law")
     ap.add_argument("--problem", choices=["ellipse", "nozzle"], default="ellipse")
     ap.add_argument("--geometry-mode", choices=["random_ellipse", "fixed_ellipse"],
                     default="random_ellipse",
@@ -835,7 +861,8 @@ def main() -> None:
 
     print(
         f"Sweep: n={args.n}  family={family.name}  ood_flag={args.ood}  "
-        f"problem={args.problem}  geometry_mode={args.geometry_mode}",
+        f"problem={args.problem}  geometry_mode={args.geometry_mode}  "
+        f"viscosity_law={args.viscosity_law}",
         flush=True,
     )
     print(f"Repo : {repo}\nOut  : {out_root}", flush=True)
@@ -846,6 +873,12 @@ def main() -> None:
     sim_records = []
     for i in range(args.n):
         physics = family.sample_physics(rng)
+        if args.viscosity_law != "family":
+            physics["viscosity_law"] = args.viscosity_law
+            if args.viscosity_law == "power_law" and args.power_law_n is not None:
+                physics["power_law_n"] = float(args.power_law_n)
+        elif args.power_law_n is not None and physics.get("viscosity_law") == "power_law":
+            physics["power_law_n"] = float(args.power_law_n)
         if args.geometry_mode == "fixed_ellipse":
             if args.sample_mesh_params and i == 0:
                 print(
@@ -934,6 +967,8 @@ def main() -> None:
             "device": args.device,
             "compile": bool(args.compile),
             "sample_mesh_params": args.sample_mesh_params,
+            "viscosity_law_override": args.viscosity_law,
+            "power_law_n_override": args.power_law_n,
             "geometry_mode": args.geometry_mode,
             "base_mesh": {
                 "lnscale": args.lnscale,

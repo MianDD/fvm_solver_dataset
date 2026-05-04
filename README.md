@@ -139,6 +139,9 @@ Important sweep options:
 - `--geometry-mode fixed_ellipse` uses one deterministic geometry for reliable
   CSD3 dataset generation while still varying physical/PDE parameters
 - `--sample-mesh-params` also samples `lnscale`, `min_A`, and `max_A`
+- `--viscosity-law {family,sutherland,constant,power_law}` optionally overrides
+  the family-sampled constitutive law
+- `--power-law-n` sets the exponent for `power_law` viscosity
 - `--max-mesh-retries` and `--mesh-attempt-timeout-s` bound mesh-generation
   failures
 - `--validate-physics` marks bad trajectories as `invalid`
@@ -167,9 +170,14 @@ Each grid `.npz` includes:
 - `states` and backward-compatible `snapshots`, shaped `(T, C, H, W)`
 - `times`, shaped `(T,)`
 - `channel_names`, currently `[V_x, V_y, rho, T]`
+- `mask`, shaped `(H, W)`, with `1` for fluid grid points and `0` for
+  solid/invalid/outside-obstacle points
 - `x_coords`, `y_coords`, `dx`, `dy`, and `bbox`
 - `metadata_json` and `cfg_json`
-- `pde_vec` for diagnostics
+- `pde_vec` and `pde_vec_names` for physical-parameter diagnostics
+
+Older grid files without `mask` still load: the dataset class creates an
+all-fluid mask and prints warnings when mask-dependent options are requested.
 
 ## Transformer Surrogate
 
@@ -194,6 +202,13 @@ Current model options:
   Forward Euler
 - `--use-derivatives` adds `dx`, `dy`, and `dt` input features only; targets
   remain `[V_x, V_y, rho, T]`
+- `--use-mask-channel` appends the static fluid mask as an input channel
+- `--mask-loss` computes the prediction loss over fluid cells only
+- `--pde-aux-loss --pde-aux-weight 0.01` adds an optional auxiliary head that
+  predicts `pde_vec` from pooled latent context tokens
+- `--pos-encoding learned_absolute` is the default checkpoint-compatible
+  position embedding; `--pos-encoding sinusoidal` is parameter-free and less
+  tied to learned position-table sizes
 - `--strides 1,2,4` trains on variable temporal strides when enough frames
   exist
 - `--input-noise-std 0.0` keeps deterministic baseline behavior
@@ -236,6 +251,36 @@ Smoke-test both attention paths:
 ```powershell
 .\.venv\Scripts\python.exe -m ml.smoke_attention
 ```
+
+Smoke-test the Report 1 optional features on synthetic tensors:
+
+```powershell
+.\.venv\Scripts\python.exe -m ml.smoke_report1
+```
+
+## Report 1 Extensions And Scope
+
+Boundary masks are included in new gridded datasets so the model can receive
+geometry information and the loss can ignore solid or invalid cells. Enable
+them during training with `--use-mask-channel --mask-loss`.
+
+The optional PDE auxiliary head is a lightweight way to test whether the
+temporal context encodes enough information to recover sampled physical
+parameters. It is enabled with `--pde-aux-loss`; if a grid file lacks `pde_vec`,
+baseline training still works, while an explicitly requested auxiliary loss
+raises a clear error.
+
+The solver now supports three shear-viscosity laws: `sutherland` (the original
+default), `constant`, and `power_law`. This is a first modular step toward
+varying constitutive relations. It is not a full generic PDE registry: the
+solver is still primarily the ideal-gas compressible Navier-Stokes family, with
+scalar parameter variation and initial constitutive-law variation.
+
+The temporal context window supports implicit PDE identification from observed
+dynamics, but it is not identical to TabPFN-style explicit in-context learning.
+Future technical work should add non-ideal equations of state, non-Newtonian or
+temperature-dependent rheology beyond this first law switch, a cleaner PDE
+registry, and neural-operator baselines.
 
 ## Evaluation And Plotting
 

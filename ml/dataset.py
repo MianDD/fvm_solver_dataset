@@ -41,6 +41,18 @@ def derivative_channel_names(base_names: Sequence[str] = TARGET_CHANNEL_NAMES) -
     return names
 
 
+def input_channel_names(use_derivatives: bool = False,
+                        use_mask_channel: bool = False,
+                        base_names: Sequence[str] = TARGET_CHANNEL_NAMES) -> List[str]:
+    names = (
+        derivative_channel_names(base_names)
+        if use_derivatives else list(base_names)
+    )
+    if use_mask_channel:
+        names = list(names) + ["fluid_mask"]
+    return names
+
+
 def _json_from_npz_value(value) -> Dict:
     if value is None:
         return {}
@@ -76,6 +88,16 @@ def load_grid_record(path: str | Path) -> Dict:
         channel_names = [str(x) for x in z["channel_names"].tolist()]
     else:
         channel_names = list(TARGET_CHANNEL_NAMES)
+    if "mask" in z:
+        mask = z["mask"].astype(np.float32)
+        if mask.ndim == 3 and mask.shape[0] == 1:
+            mask = mask[0]
+        if mask.shape != states.shape[-2:]:
+            raise ValueError(f"{path} mask shape {mask.shape} does not match grid {states.shape[-2:]}")
+        mask_available = True
+    else:
+        mask = np.ones(states.shape[-2:], dtype=np.float32)
+        mask_available = False
     metadata = _json_from_npz_value(z["metadata_json"] if "metadata_json" in z else None)
     cfg = _json_from_npz_value(z["cfg_json"] if "cfg_json" in z else None)
     if not metadata:
@@ -101,9 +123,13 @@ def load_grid_record(path: str | Path) -> Dict:
         "dx": dx,
         "dy": dy,
         "physical_spacing": physical_spacing,
+        "mask": mask,
+        "mask_available": mask_available,
         "channel_names": channel_names,
         "metadata": metadata,
         "pde_vec": z["pde_vec"].astype(np.float32) if "pde_vec" in z else np.zeros(9, dtype=np.float32),
+        "pde_vec_available": "pde_vec" in z,
+        "pde_vec_names": [str(x) for x in z["pde_vec_names"].tolist()] if "pde_vec_names" in z else [],
     }
 
 
@@ -171,18 +197,28 @@ def build_input_features(frames: np.ndarray, times: np.ndarray | None = None,
                          dx_spacing: float | None = None,
                          dy_spacing: float | None = None,
                          use_derivatives: bool = False,
-                         derivative_mode: str = "central") -> np.ndarray:
+                         derivative_mode: str = "central",
+                         mask: np.ndarray | None = None,
+                         use_mask_channel: bool = False) -> np.ndarray:
     if not use_derivatives:
-        return np.asarray(frames, dtype=np.float32)
-    if dx_spacing is None or dy_spacing is None:
-        print("WARNING: grid spacing missing; derivative features use index spacing.")
-    return compute_derivative_features(
-        frames,
-        times=times,
-        dx_spacing=dx_spacing,
-        dy_spacing=dy_spacing,
-        mode=derivative_mode,
-    )
+        features = np.asarray(frames, dtype=np.float32)
+    else:
+        if dx_spacing is None or dy_spacing is None:
+            print("WARNING: grid spacing missing; derivative features use index spacing.")
+        features = compute_derivative_features(
+            frames,
+            times=times,
+            dx_spacing=dx_spacing,
+            dy_spacing=dy_spacing,
+            mode=derivative_mode,
+        )
+    if use_mask_channel:
+        if mask is None:
+            mask = np.ones(frames.shape[-2:], dtype=np.float32)
+        mask_ch = np.asarray(mask, dtype=np.float32)[None, None, :, :]
+        mask_ch = np.repeat(mask_ch, features.shape[0], axis=0)
+        features = np.concatenate([features, mask_ch], axis=1)
+    return features.astype(np.float32)
 
 
 class CFDWindowDataset(Dataset):
@@ -199,13 +235,15 @@ class CFDWindowDataset(Dataset):
                  strides: str | Sequence[int] | int = 1,
                  stride: int | None = None,
                  use_derivatives: bool = False,
-                 derivative_mode: str = "central"):
+                 derivative_mode: str = "central",
+                 use_mask_channel: bool = False):
         self.paths = [Path(p) for p in paths]
         self.context_length = int(context_length)
         self.prediction_horizon = int(prediction_horizon)
         self.strides = parse_strides(stride if stride is not None else strides)
         self.use_derivatives = bool(use_derivatives)
         self.derivative_mode = derivative_mode
+        self.use_mask_channel = bool(use_mask_channel)
 
         self._cache: List[Dict] = []
         self.windows: List[Tuple[int, int, int]] = []  # (sim_idx, start, temporal_stride)
@@ -224,6 +262,16 @@ class CFDWindowDataset(Dataset):
             all(bool(rec["physical_spacing"]) for rec in self._cache)
             if self._cache else False
         )
+        self.has_masks = (
+            all(bool(rec["mask_available"]) for rec in self._cache)
+            if self._cache else False
+        )
+        self.has_pde_vec = (
+            all(bool(rec["pde_vec_available"]) for rec in self._cache)
+            if self._cache else False
+        )
+        pde_lengths = {int(rec["pde_vec"].shape[0]) for rec in self._cache if rec["pde_vec_available"]}
+        self.pde_dim = pde_lengths.pop() if len(pde_lengths) == 1 else 0
 
     def __len__(self) -> int:
         return len(self.windows)
@@ -256,6 +304,8 @@ class CFDWindowDataset(Dataset):
             dy_spacing=rec["dy"],
             use_derivatives=self.use_derivatives,
             derivative_mode=self.derivative_mode,
+            mask=rec["mask"],
+            use_mask_channel=self.use_mask_channel,
         )
         metadata = rec["metadata"]
         return {
@@ -263,6 +313,8 @@ class CFDWindowDataset(Dataset):
             "target_states": torch.from_numpy(future.copy()).float(),
             "context_states": torch.from_numpy(context.copy()).float(),
             "states": torch.from_numpy(states.copy()).float(),
+            "mask": torch.from_numpy(rec["mask"].copy()).float(),
+            "target_mask": torch.from_numpy(rec["mask"].copy()).float(),
             "times": torch.from_numpy(times.copy()).float(),
             "dt": torch.tensor(eff_dt, dtype=torch.float32),
             "dx": torch.tensor(rec["dx"] if rec["dx"] is not None else 1.0, dtype=torch.float32),
@@ -270,6 +322,7 @@ class CFDWindowDataset(Dataset):
             "uses_physical_spacing": torch.tensor(bool(rec["physical_spacing"]), dtype=torch.bool),
             "stride": torch.tensor(temporal_stride, dtype=torch.long),
             "pde_vec": torch.from_numpy(rec["pde_vec"].copy()).float(),
+            "pde_vec_available": torch.tensor(bool(rec["pde_vec_available"]), dtype=torch.bool),
             "sim_idx": torch.tensor(sim_idx, dtype=torch.long),
             "sim_id": str(metadata.get("sim_id", Path(rec["path"]).stem)),
             "family": str(metadata.get("family", "unknown")),
@@ -278,10 +331,7 @@ class CFDWindowDataset(Dataset):
 
     @property
     def channel_names(self) -> List[str]:
-        return (
-            derivative_channel_names(TARGET_CHANNEL_NAMES)
-            if self.use_derivatives else list(TARGET_CHANNEL_NAMES)
-        )
+        return input_channel_names(self.use_derivatives, self.use_mask_channel, TARGET_CHANNEL_NAMES)
 
     @property
     def target_channel_names(self) -> List[str]:

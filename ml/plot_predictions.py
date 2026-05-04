@@ -34,6 +34,7 @@ def _settings(ckpt: dict, use_derivatives, derivative_mode, prediction_mode, int
     stride_text = ckpt_strides if isinstance(ckpt_strides, str) else ",".join(str(s) for s in ckpt_strides)
     return {
         "use_derivatives": use_derivatives if use_derivatives is not None else bool(_cfg_value(ckpt, "use_derivatives", False)),
+        "use_mask_channel": bool(_cfg_value(ckpt, "use_mask_channel", False)),
         "derivative_mode": derivative_mode or _cfg_value(ckpt, "derivative_mode", "central"),
         "prediction_mode": prediction_mode or _cfg_value(ckpt, "prediction_mode", "delta"),
         "integrator": integrator or _cfg_value(ckpt, "integrator", "euler"),
@@ -113,6 +114,8 @@ def plot_predictions(grid_dir: str | Path, ckpt_path: str | Path, out_dir: str |
             dy_spacing=rec["dy"],
             use_derivatives=settings["use_derivatives"],
             derivative_mode=settings["derivative_mode"],
+            mask=rec["mask"],
+            use_mask_channel=settings["use_mask_channel"],
         )
         states_t = torch.from_numpy(features).unsqueeze(0).to(device)
         current_t = torch.from_numpy(context_states[-1]).unsqueeze(0).to(device)
