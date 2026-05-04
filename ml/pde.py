@@ -1,0 +1,254 @@
+"""Utilities for PDE-parameter auxiliary learning and evaluation."""
+
+from __future__ import annotations
+
+from typing import Dict, Iterable, List, Sequence
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+
+BASE_PDE_NAMES = [
+    "gamma",
+    "viscosity",
+    "visc_bulk",
+    "thermal_cond",
+    "C_v",
+    "T_0",
+    "rho_inf",
+    "T_inf",
+    "v_n_inf",
+]
+VISCOSITY_LAW_NAMES = ["sutherland", "constant", "power_law"]
+VISCOSITY_LAW_VEC_NAMES = [f"viscosity_law_{name}" for name in VISCOSITY_LAW_NAMES]
+POWER_LAW_N_NAME = "power_law_n"
+DEFAULT_PDE_VEC_NAMES = BASE_PDE_NAMES + VISCOSITY_LAW_VEC_NAMES + [POWER_LAW_N_NAME]
+
+
+def default_pde_names(dim: int) -> List[str]:
+    """Return stable names for known pde_vec layouts."""
+    dim = int(dim)
+    if dim == len(DEFAULT_PDE_VEC_NAMES):
+        return list(DEFAULT_PDE_VEC_NAMES)
+    if dim == len(BASE_PDE_NAMES):
+        return list(BASE_PDE_NAMES)
+    return [f"pde_{i}" for i in range(dim)]
+
+
+def infer_pde_schema(names: Sequence[str] | None = None,
+                     pde_dim: int | None = None) -> Dict:
+    """Infer continuous and categorical slices from pde_vec names.
+
+    The current 13D layout is:
+    continuous base parameters, three viscosity-law one-hot entries, and
+    ``power_law_n``.  The old 9D layout has no categorical slice and is treated
+    as all-continuous for backward compatibility.
+    """
+    if names:
+        vec_names = [str(name) for name in names]
+        dim = len(vec_names)
+    else:
+        dim = int(pde_dim or 0)
+        vec_names = default_pde_names(dim)
+    if pde_dim is not None and len(vec_names) != int(pde_dim):
+        vec_names = default_pde_names(int(pde_dim))
+    dim = len(vec_names)
+
+    law_indices: List[int] = []
+    if all(name in vec_names for name in VISCOSITY_LAW_VEC_NAMES):
+        law_indices = [vec_names.index(name) for name in VISCOSITY_LAW_VEC_NAMES]
+    law_index_set = set(law_indices)
+    continuous_indices = [i for i in range(dim) if i not in law_index_set]
+    power_law_n_index = vec_names.index(POWER_LAW_N_NAME) if POWER_LAW_N_NAME in vec_names else None
+    return {
+        "pde_vec_names": vec_names,
+        "pde_dim": dim,
+        "continuous_indices": continuous_indices,
+        "continuous_names": [vec_names[i] for i in continuous_indices],
+        "viscosity_law_indices": law_indices,
+        "viscosity_law_names": list(VISCOSITY_LAW_NAMES) if law_indices else [],
+        "power_law_n_index": power_law_n_index,
+        "has_viscosity_law": bool(law_indices),
+    }
+
+
+def pde_vectors_from_records(records: Iterable[Dict]) -> np.ndarray:
+    vectors = [
+        np.asarray(rec["pde_vec"], dtype=np.float32)
+        for rec in records
+        if bool(rec.get("pde_vec_available", False))
+    ]
+    if not vectors:
+        return np.zeros((0, 0), dtype=np.float32)
+    return np.stack(vectors, axis=0).astype(np.float32)
+
+
+def compute_pde_normalizer(vectors: np.ndarray, min_std: float = 1e-6) -> Dict:
+    vectors = np.asarray(vectors, dtype=np.float32)
+    if vectors.ndim != 2 or vectors.shape[0] == 0:
+        raise ValueError("Cannot compute PDE normalizer from an empty vector set.")
+    mean = vectors.mean(axis=0).astype(np.float32)
+    std = vectors.std(axis=0).astype(np.float32)
+    std = np.maximum(std, float(min_std)).astype(np.float32)
+    return {
+        "mean": mean.tolist(),
+        "std": std.tolist(),
+        "min_std": float(min_std),
+        "n_train_vectors": int(vectors.shape[0]),
+    }
+
+
+def pde_loss_components(pred: torch.Tensor,
+                        true: torch.Tensor,
+                        schema: Dict,
+                        normalizer: Dict | None = None,
+                        normalize: bool = True,
+                        cont_weight: float = 1.0,
+                        law_weight: float = 1.0) -> Dict[str, torch.Tensor]:
+    """Compute schema-aware PDE auxiliary losses.
+
+    The continuous slice is regressed in physical units, but the MSE is computed
+    after optional z-scoring by training-set pde_vec statistics.  The viscosity
+    law one-hot slice, when present, is interpreted as logits and trained with
+    cross entropy.
+    """
+    if pred is None:
+        raise ValueError("pred must not be None when PDE auxiliary loss is enabled.")
+    if pred.shape != true.shape:
+        raise ValueError(f"pde prediction shape {tuple(pred.shape)} != target {tuple(true.shape)}")
+    zero = pred.new_zeros(())
+    cont_loss = zero
+    law_loss = zero
+    law_acc = zero
+
+    cont_indices = [int(i) for i in schema.get("continuous_indices", [])]
+    if cont_indices:
+        idx = torch.as_tensor(cont_indices, dtype=torch.long, device=pred.device)
+        pred_cont = pred.index_select(1, idx)
+        true_cont = true.index_select(1, idx)
+        if normalize and normalizer is not None:
+            mean = torch.as_tensor(normalizer["mean"], dtype=pred.dtype, device=pred.device).index_select(0, idx)
+            std = torch.as_tensor(normalizer["std"], dtype=pred.dtype, device=pred.device).index_select(0, idx)
+            pred_cont = (pred_cont - mean.view(1, -1)) / std.view(1, -1).clamp_min(1e-6)
+            true_cont = (true_cont - mean.view(1, -1)) / std.view(1, -1).clamp_min(1e-6)
+        cont_loss = torch.mean((pred_cont - true_cont) ** 2)
+
+    law_indices = [int(i) for i in schema.get("viscosity_law_indices", [])]
+    if law_indices:
+        idx = torch.as_tensor(law_indices, dtype=torch.long, device=pred.device)
+        logits = pred.index_select(1, idx)
+        target_class = true.index_select(1, idx).argmax(dim=1)
+        law_loss = F.cross_entropy(logits, target_class)
+        law_acc = (logits.argmax(dim=1) == target_class).to(dtype=pred.dtype).mean()
+
+    total = float(cont_weight) * cont_loss + float(law_weight) * law_loss
+    return {
+        "total": total,
+        "continuous": cont_loss,
+        "law": law_loss,
+        "law_accuracy": law_acc.detach(),
+    }
+
+
+def _float_or_none(value: float | np.floating) -> float | None:
+    value = float(value)
+    if not np.isfinite(value):
+        return None
+    return value
+
+
+def compute_pde_metrics(pred: np.ndarray,
+                        true: np.ndarray,
+                        schema: Dict | None = None,
+                        names: Sequence[str] | None = None,
+                        normalizer: Dict | None = None) -> Dict:
+    """Return report-friendly PDE identification metrics."""
+    pred = np.asarray(pred, dtype=np.float64)
+    true = np.asarray(true, dtype=np.float64)
+    if pred.ndim != 2 or true.ndim != 2 or pred.shape != true.shape:
+        raise ValueError(f"Expected matching 2D arrays, got pred={pred.shape}, true={true.shape}")
+    schema = schema or infer_pde_schema(names, pred.shape[1])
+    cont_indices = [int(i) for i in schema.get("continuous_indices", [])]
+
+    continuous = {
+        "indices": cont_indices,
+        "names": [schema["pde_vec_names"][i] for i in cont_indices],
+        "per_dimension": {},
+        "mean_mae": None,
+        "mean_rmse": None,
+        "mean_r2": None,
+        "mean_normalized_mae": None,
+    }
+    maes: List[float] = []
+    rmses: List[float] = []
+    r2s: List[float] = []
+    nmaes: List[float] = []
+    norm_std = None
+    if normalizer is not None and "std" in normalizer:
+        norm_std = np.asarray(normalizer["std"], dtype=np.float64)
+
+    for i in cont_indices:
+        err = pred[:, i] - true[:, i]
+        mae = float(np.mean(np.abs(err)))
+        rmse = float(np.sqrt(np.mean(err ** 2)))
+        denom = float(np.sum((true[:, i] - np.mean(true[:, i])) ** 2))
+        r2 = None if denom <= 1e-12 else _float_or_none(1.0 - float(np.sum(err ** 2)) / denom)
+        normalized_mae = None
+        if norm_std is not None and i < len(norm_std) and norm_std[i] > 0:
+            normalized_mae = float(mae / max(float(norm_std[i]), 1e-6))
+            nmaes.append(normalized_mae)
+        name = schema["pde_vec_names"][i]
+        continuous["per_dimension"][name] = {
+            "index": i,
+            "mae": mae,
+            "rmse": rmse,
+            "r2": r2,
+            "normalized_mae": normalized_mae,
+        }
+        maes.append(mae)
+        rmses.append(rmse)
+        if r2 is not None:
+            r2s.append(r2)
+    if maes:
+        continuous["mean_mae"] = float(np.mean(maes))
+        continuous["mean_rmse"] = float(np.mean(rmses))
+    if r2s:
+        continuous["mean_r2"] = float(np.mean(r2s))
+    if nmaes:
+        continuous["mean_normalized_mae"] = float(np.mean(nmaes))
+
+    law_metrics = None
+    law_indices = [int(i) for i in schema.get("viscosity_law_indices", [])]
+    if law_indices:
+        law_names = list(schema.get("viscosity_law_names", VISCOSITY_LAW_NAMES))
+        true_class = true[:, law_indices].argmax(axis=1)
+        pred_class = pred[:, law_indices].argmax(axis=1)
+        n_cls = len(law_indices)
+        confusion = np.zeros((n_cls, n_cls), dtype=np.int64)
+        for t, p in zip(true_class, pred_class):
+            confusion[int(t), int(p)] += 1
+        per_class = {}
+        for i, name in enumerate(law_names):
+            denom = int(confusion[i].sum())
+            per_class[name] = None if denom == 0 else float(confusion[i, i] / denom)
+        law_metrics = {
+            "indices": law_indices,
+            "names": law_names,
+            "accuracy": float(np.mean(pred_class == true_class)) if len(true_class) else None,
+            "confusion_matrix": confusion.tolist(),
+            "confusion_matrix_rows_true_cols_pred": True,
+            "per_class_accuracy": per_class,
+        }
+
+    return {
+        "pde_schema": schema,
+        "n_samples": int(pred.shape[0]),
+        "continuous": continuous,
+        "viscosity_law": law_metrics,
+        "overall": {
+            "mean_continuous_r2": continuous["mean_r2"],
+            "mean_continuous_mae": continuous["mean_mae"],
+            "law_accuracy": None if law_metrics is None else law_metrics["accuracy"],
+        },
+    }

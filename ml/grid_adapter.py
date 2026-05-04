@@ -10,6 +10,11 @@ from typing import Any, Dict, List, Tuple
 import numpy as np
 from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
 
+try:
+    from .pde import DEFAULT_PDE_VEC_NAMES, VISCOSITY_LAW_NAMES
+except ImportError:  # pragma: no cover - allows direct ``python ml/grid_adapter.py``
+    from pde import DEFAULT_PDE_VEC_NAMES, VISCOSITY_LAW_NAMES
+
 
 CHANNEL_NAMES = ["V_x", "V_y", "rho", "T"]
 PHYSICAL_KEYS = [
@@ -17,7 +22,7 @@ PHYSICAL_KEYS = [
     "T_0", "rho_inf", "T_inf", "v_n_inf",
     "viscosity_law", "power_law_n",
 ]
-VISCOSITY_LAWS = ["sutherland", "constant", "power_law"]
+VISCOSITY_LAWS = list(VISCOSITY_LAW_NAMES)
 MESH_KEYS = ["lnscale", "min_A", "max_A", "mesh_seed"]
 TIME_KEYS = ["dt", "save_t", "n_iter", "end_t"]
 
@@ -255,12 +260,7 @@ def pde_fingerprint(cfg: Dict) -> np.ndarray:
 
 
 def pde_fingerprint_names() -> List[str]:
-    return [
-        "gamma", "viscosity", "visc_bulk", "thermal_cond", "C_v",
-        "T_0", "rho_inf", "T_inf", "v_n_inf",
-        *[f"viscosity_law_{name}" for name in VISCOSITY_LAWS],
-        "power_law_n",
-    ]
+    return list(DEFAULT_PDE_VEC_NAMES)
 
 
 def timestep_files(sim_dir: Path) -> List[Path]:

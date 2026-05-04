@@ -49,9 +49,11 @@ sweep/summarize_dataset.py Dataset status and parameter summary tool
 ml/grid_adapter.py         Raw unstructured snapshots to grid .npz tensors
 ml/dataset.py              Sliding-window dataset and derivative features
 ml/model.py                Patch Transformer and factorized attention model
+ml/pde.py                  PDE vector schema, normalized loss, metrics helpers
 ml/train.py                Training entry point
 ml/evaluate.py             One-step and rollout evaluation
 ml/plot_predictions.py     Prediction/error figure generation
+ml/plot_report1_metrics.py Report 1 PDE/rollout metric figures
 ml/smoke_attention.py      Global/factorized attention smoke test
 docs/workflow.md           More detailed local and CSD3 workflow
 scripts/                   CSD3 Slurm templates and experiment scripts
@@ -206,6 +208,11 @@ Current model options:
 - `--mask-loss` computes the prediction loss over fluid cells only
 - `--pde-aux-loss --pde-aux-weight 0.01` adds an optional auxiliary head that
   predicts `pde_vec` from pooled latent context tokens
+- `--pde-normalize` is enabled by default with `--pde-aux-loss`; it computes
+  `pde_vec` mean/std from the training split only and stores those statistics
+  in the checkpoint
+- `--pde-cont-weight` and `--pde-law-weight` weight the continuous-parameter
+  regression and viscosity-law classification terms inside the auxiliary loss
 - `--pos-encoding learned_absolute` is the default checkpoint-compatible
   position embedding; `--pos-encoding sinusoidal` is parameter-free and less
   tied to learned position-table sizes
@@ -270,6 +277,24 @@ parameters. It is enabled with `--pde-aux-loss`; if a grid file lacks `pde_vec`,
 baseline training still works, while an explicitly requested auxiliary loss
 raises a clear error.
 
+Because `pde_vec` mixes values with different scales, the auxiliary loss
+normalizes continuous parameters using train-set-only mean/std by default. For
+the current 13D schema, the viscosity-law one-hot slice is treated as
+classification logits and trained with cross entropy; old 9D `pde_vec` files
+fall back to normalized MSE over all dimensions.
+
+Example Report 1 training command:
+
+```powershell
+.\.venv\Scripts\python.exe -m ml.train --grid datasets\grid_fixed_id20 --out checkpoints\fixed_id20_report1 `
+  --epochs 10 --batch 4 --context 4 --horizon 1 --device cpu `
+  --d-model 128 --heads 4 --layers 4 --patch 8 `
+  --attention-type factorized --prediction-mode derivative --integrator euler `
+  --use-derivatives --use-mask-channel --mask-loss `
+  --pde-aux-loss --pde-normalize --pde-aux-weight 0.01 `
+  --pde-cont-weight 1.0 --pde-law-weight 1.0
+```
+
 The solver now supports three shear-viscosity laws: `sutherland` (the original
 default), `constant`, and `power_law`. This is a first modular step toward
 varying constitutive relations. It is not a full generic PDE registry: the
@@ -304,6 +329,17 @@ Plot predictions:
 
 Evaluation and plotting load model settings from the checkpoint by default,
 including derivative features, prediction mode, integrator, and strides.
+If the checkpoint has a PDE auxiliary head and the grid files include
+`pde_vec`, `ml.evaluate` also writes `pde_metrics.json` with continuous
+parameter MAE/RMSE/R2 and viscosity-law accuracy/confusion-matrix metrics.
+
+Create Report 1 metric figures from an evaluation JSON:
+
+```powershell
+.\.venv\Scripts\python.exe -m ml.plot_report1_metrics `
+  --metrics eval\fixed_id20_factorized\metrics.json `
+  --out figures\report1\fixed_id20_factorized
+```
 
 ## CSD3 Scripts
 

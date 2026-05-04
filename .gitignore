@@ -51,6 +51,7 @@ logs/
 eval/
 figures/predictions/
 figures/generated/
+figures/report1/
 
 # Local model checkpoints / training outputs
 checkpoints/

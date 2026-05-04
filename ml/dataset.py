@@ -15,6 +15,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from .pde import default_pde_names, infer_pde_schema
+
 
 TARGET_CHANNEL_NAMES = ["V_x", "V_y", "rho", "T"]
 
@@ -272,6 +274,18 @@ class CFDWindowDataset(Dataset):
         )
         pde_lengths = {int(rec["pde_vec"].shape[0]) for rec in self._cache if rec["pde_vec_available"]}
         self.pde_dim = pde_lengths.pop() if len(pde_lengths) == 1 else 0
+        pde_name_sets = {
+            tuple(rec["pde_vec_names"])
+            for rec in self._cache
+            if rec["pde_vec_available"] and rec["pde_vec_names"]
+        }
+        if len(pde_name_sets) == 1:
+            self.pde_vec_names = list(next(iter(pde_name_sets)))
+        elif self.pde_dim > 0:
+            self.pde_vec_names = default_pde_names(self.pde_dim)
+        else:
+            self.pde_vec_names = []
+        self.pde_schema = infer_pde_schema(self.pde_vec_names, self.pde_dim) if self.pde_dim > 0 else {}
 
     def __len__(self) -> int:
         return len(self.windows)

@@ -19,6 +19,7 @@ from .dataset import (
     load_grid_record,
     parse_strides,
 )
+from .pde import compute_pde_metrics
 
 
 CHANNEL_NAMES = TARGET_CHANNEL_NAMES
@@ -101,7 +102,8 @@ def _predict_next(model, batch: Dict, settings: Dict, device: str):
     current = batch["context_states"][:, -1].to(device)
     target = batch["target_states"][:, 0].to(device)
     dt = batch["dt"].to(device)
-    update = model.predict_update(features, normalised=False)[:, -1]
+    update_seq, pred_pde = model.predict_update_and_pde(features, normalised=False)
+    update = update_seq[:, -1]
     pred = model.integrate_update(
         current,
         update,
@@ -109,7 +111,7 @@ def _predict_next(model, batch: Dict, settings: Dict, device: str):
         integrator=settings["integrator"],
         dt=dt,
     )
-    return pred, target
+    return pred, target, pred_pde
 
 
 def _rollout_one_file(model, path: str | Path, context: int, steps: int,
@@ -202,11 +204,22 @@ def evaluate(grid_dir: str | Path, ckpt_path: str | Path, out_dir: str | Path,
     overall = _init_accumulators(C)
     by_stride: Dict[str, Dict] = {}
     by_family: Dict[str, Dict] = {}
+    can_eval_pde = bool(getattr(model, "pde_head", None) is not None and ds.has_pde_vec)
+    pde_pred_chunks: List[torch.Tensor] = []
+    pde_true_chunks: List[torch.Tensor] = []
+    pde_skip_reason = None
+    if getattr(model, "pde_head", None) is None:
+        pde_skip_reason = "checkpoint has no PDE auxiliary head"
+    elif not ds.has_pde_vec:
+        pde_skip_reason = "grid dataset has no pde_vec"
     model.eval()
     with torch.no_grad():
         for batch in loader:
-            pred, target = _predict_next(model, batch, settings, device)
+            pred, target, pred_pde = _predict_next(model, batch, settings, device)
             _update(overall, pred, target)
+            if can_eval_pde and pred_pde is not None:
+                pde_pred_chunks.append(pred_pde.detach().cpu())
+                pde_true_chunks.append(batch["pde_vec"].detach().cpu())
             strides_b = batch["stride"].detach().cpu().tolist()
             families = batch["family"]
             for i, stride_i in enumerate(strides_b):
@@ -255,6 +268,24 @@ def evaluate(grid_dir: str | Path, ckpt_path: str | Path, out_dir: str | Path,
         "by_family": {k: _finalize(v) for k, v in sorted(by_family.items())},
         "rollout": rollout_metrics,
     }
+    if can_eval_pde and pde_pred_chunks:
+        model_cfg = ckpt.get("model_config", {})
+        ckpt_schema = ckpt.get("pde_schema") or model_cfg.get("pde_schema") or {}
+        schema = ckpt_schema if ckpt_schema else ds.pde_schema
+        pde_normalizer = ckpt.get("pde_normalizer") or model_cfg.get("pde_normalizer")
+        pde_metrics = compute_pde_metrics(
+            torch.cat(pde_pred_chunks, dim=0).numpy(),
+            torch.cat(pde_true_chunks, dim=0).numpy(),
+            schema=schema,
+            normalizer=pde_normalizer,
+        )
+        pde_metrics["normalizer_available"] = pde_normalizer is not None
+        metrics["pde_identification"] = pde_metrics
+        (out_dir / "pde_metrics.json").write_text(json.dumps(pde_metrics, indent=2), encoding="utf-8")
+    else:
+        reason = pde_skip_reason or "no PDE predictions were produced"
+        metrics["pde_identification_skipped"] = reason
+        print(f"PDE identification metrics skipped because {reason}.")
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
     try:

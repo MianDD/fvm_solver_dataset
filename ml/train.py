@@ -21,6 +21,12 @@ from .dataset import (
     split_paths,
 )
 from .model import FoundationCFDModel, count_params
+from .pde import (
+    compute_pde_normalizer,
+    infer_pde_schema,
+    pde_loss_components,
+    pde_vectors_from_records,
+)
 
 
 HORIZON_ERROR = "Only --horizon 1 is currently supported. Multi-horizon training is not implemented yet."
@@ -52,6 +58,9 @@ class TrainConfig:
     mask_loss: bool = False
     pde_aux_loss: bool = False
     pde_aux_weight: float = 0.01
+    pde_normalize: bool = True
+    pde_cont_weight: float = 1.0
+    pde_law_weight: float = 1.0
     pde_dim: int = 0
     num_workers: int = 0
     save_every: int = 0
@@ -173,6 +182,9 @@ def model_config_dict(cfg: TrainConfig, C_in: int, H: int, W: int) -> Dict:
         "integrator": cfg.integrator,
         "pde_aux_loss": cfg.pde_aux_loss,
         "pde_aux_weight": cfg.pde_aux_weight,
+        "pde_normalize": cfg.pde_normalize if cfg.pde_aux_loss else False,
+        "pde_cont_weight": cfg.pde_cont_weight,
+        "pde_law_weight": cfg.pde_law_weight,
         "pde_dim": cfg.pde_dim if cfg.pde_aux_loss else 0,
         "strides": parse_strides(cfg.strides),
     }
@@ -240,6 +252,8 @@ def save_checkpoint(path: Path, model: FoundationCFDModel, optim, sched,
             "mean": model.normaliser.mean.detach().cpu().tolist(),
             "std": model.normaliser.std.detach().cpu().tolist(),
         },
+        "pde_schema": model_config.get("pde_schema", {}),
+        "pde_normalizer": model_config.get("pde_normalizer"),
     }, path)
 
 
@@ -280,12 +294,17 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         raise ValueError("--input-noise-std must be non-negative.")
     if cfg.pde_aux_weight < 0.0:
         raise ValueError("--pde-aux-weight must be non-negative.")
+    if cfg.pde_cont_weight < 0.0:
+        raise ValueError("--pde-cont-weight must be non-negative.")
+    if cfg.pde_law_weight < 0.0:
+        raise ValueError("--pde-law-weight must be non-negative.")
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     out_dir = Path(cfg.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     set_seed(cfg.seed)
     parse_strides(cfg.strides)
     save_json(out_dir / "train_config.json", dc.asdict(cfg))
+    resume_ckpt = torch.load(cfg.resume, map_location="cpu") if cfg.resume else None
 
     train_paths, val_paths = split_paths(cfg.grid_dir, val_frac=cfg.val_frac, seed=cfg.seed)
     print(f"#train sims = {len(train_paths)}   #val sims = {len(val_paths)}")
@@ -317,6 +336,8 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         print("WARNING: mask loss requested but one or more grid files lack masks; missing masks use all-fluid defaults.")
     if cfg.use_mask_channel and not (train_ds.has_masks and val_ds.has_masks):
         print("WARNING: mask channel requested but one or more grid files lack masks; missing masks use all-fluid defaults.")
+    pde_schema: Dict = {}
+    pde_normalizer: Dict | None = None
     if cfg.pde_aux_loss:
         if not (train_ds.has_pde_vec and val_ds.has_pde_vec):
             raise RuntimeError("--pde-aux-loss requested but at least one grid file is missing pde_vec.")
@@ -330,6 +351,14 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
             cfg.pde_dim = inferred_pde_dim
         if cfg.pde_dim != inferred_pde_dim:
             raise RuntimeError(f"--pde-dim={cfg.pde_dim} does not match dataset pde_vec length {inferred_pde_dim}.")
+        pde_schema = infer_pde_schema(train_ds.pde_vec_names, cfg.pde_dim)
+        if cfg.pde_normalize:
+            if resume_ckpt is not None and resume_ckpt.get("pde_normalizer"):
+                pde_normalizer = resume_ckpt["pde_normalizer"]
+                print("Loaded PDE auxiliary normalizer from resume checkpoint.")
+            else:
+                pde_vectors = pde_vectors_from_records(train_ds._cache)
+                pde_normalizer = compute_pde_normalizer(pde_vectors, min_std=1e-6)
         save_json(out_dir / "train_config.json", dc.asdict(cfg))
     physical_spacing_used = bool(
         cfg.use_derivatives and train_ds.uses_physical_spacing and val_ds.uses_physical_spacing
@@ -364,15 +393,38 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         f"PDE aux loss: {'enabled' if cfg.pde_aux_loss else 'disabled'}"
         + (f"  pde_dim={cfg.pde_dim} weight={cfg.pde_aux_weight:g}" if cfg.pde_aux_loss else "")
     )
+    if cfg.pde_aux_loss:
+        law_status = "enabled" if pde_schema.get("has_viscosity_law") else "not available"
+        print(
+            f"PDE aux normalization: {'enabled' if cfg.pde_normalize else 'disabled'}  "
+            f"pde_dim={cfg.pde_dim}  law_classification={law_status}"
+        )
+        print(f"  pde_mean: {np.array(pde_normalizer['mean']).round(6).tolist() if pde_normalizer else 'not used'}")
+        print(f"  pde_std : {np.array(pde_normalizer['std']).round(6).tolist() if pde_normalizer else 'not used'}")
     print(f"Input noise std: {cfg.input_noise_std:g} normalizer-std units (training only)")
     attention_complexity = attention_complexity_dict(cfg, H, W)
     print_attention_complexity(attention_complexity)
 
     model = make_model(cfg, C_in, H, W).to(device)
+    if cfg.pde_aux_loss and pde_normalizer is not None and model.pde_head is not None and not cfg.resume:
+        with torch.no_grad():
+            model.pde_head[-1].weight.zero_()
+            bias = torch.as_tensor(pde_normalizer["mean"], dtype=torch.float32, device=device)
+            model.pde_head[-1].bias.copy_(bias)
     model_cfg = model_config_dict(cfg, C_in, H, W)
     model_cfg["physical_derivative_spacing"] = "physical" if physical_spacing_used else "index_or_unused"
     model_cfg["attention_complexity"] = attention_complexity
+    model_cfg["pde_schema"] = pde_schema
+    model_cfg["pde_normalizer"] = pde_normalizer
     save_json(out_dir / "model_config.json", model_cfg)
+    if cfg.pde_aux_loss:
+        save_json(out_dir / "pde_normalizer.json", {
+            "enabled": bool(cfg.pde_normalize),
+            "pde_schema": pde_schema,
+            "pde_normalizer": pde_normalizer,
+            "pde_cont_weight": cfg.pde_cont_weight,
+            "pde_law_weight": cfg.pde_law_weight,
+        })
     print(f"Model params: {count_params(model):,}")
 
     mean, std = compute_channel_stats(train_loader, C_in)
@@ -400,6 +452,12 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         "val_pred_loss": [],
         "train_pde_loss": [],
         "val_pde_loss": [],
+        "train_pde_cont_loss": [],
+        "val_pde_cont_loss": [],
+        "train_pde_law_loss": [],
+        "val_pde_law_loss": [],
+        "train_pde_law_acc": [],
+        "val_pde_law_acc": [],
         "epoch_time": [],
         "lr": [],
     }
@@ -413,6 +471,15 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         if "scheduler" in ckpt:
             sched.load_state_dict(ckpt["scheduler"])
         history = ckpt.get("history", history)
+        for key, value in {
+            "train_pde_cont_loss": [],
+            "val_pde_cont_loss": [],
+            "train_pde_law_loss": [],
+            "val_pde_law_loss": [],
+            "train_pde_law_acc": [],
+            "val_pde_law_acc": [],
+        }.items():
+            history.setdefault(key, value)
         start_epoch = int(ckpt.get("epoch", -1)) + 1
         best_val = float(ckpt.get("best_val_loss", best_val))
         print(f"Resumed from {cfg.resume} at epoch {start_epoch}")
@@ -423,16 +490,34 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         running = 0.0
         running_pred = 0.0
         running_pde = 0.0
+        running_pde_cont = 0.0
+        running_pde_law = 0.0
+        running_pde_law_acc = 0.0
         n_batches = 0
         for batch in train_loader:
             pred, tgt, pred_pde, true_pde = predict_next(model, batch, cfg, device, training=True)
             mask = batch["target_mask"].to(device) if cfg.mask_loss else None
             pred_loss = weighted_masked_mse(pred, tgt, mask=mask)
             if cfg.pde_aux_loss:
-                pde_loss = torch.mean((pred_pde - true_pde) ** 2)
+                pde_comp = pde_loss_components(
+                    pred_pde,
+                    true_pde,
+                    pde_schema,
+                    normalizer=pde_normalizer,
+                    normalize=cfg.pde_normalize,
+                    cont_weight=cfg.pde_cont_weight,
+                    law_weight=cfg.pde_law_weight,
+                )
+                pde_loss = pde_comp["total"]
+                pde_cont_loss = pde_comp["continuous"]
+                pde_law_loss = pde_comp["law"]
+                pde_law_acc = pde_comp["law_accuracy"]
                 loss = pred_loss + cfg.pde_aux_weight * pde_loss
             else:
                 pde_loss = torch.zeros((), dtype=pred_loss.dtype, device=pred_loss.device)
+                pde_cont_loss = pde_loss
+                pde_law_loss = pde_loss
+                pde_law_acc = pde_loss
                 loss = pred_loss
             optim.zero_grad(set_to_none=True)
             loss.backward()
@@ -442,34 +527,64 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
             running += loss.item()
             running_pred += pred_loss.item()
             running_pde += pde_loss.item()
+            running_pde_cont += pde_cont_loss.item()
+            running_pde_law += pde_law_loss.item()
+            running_pde_law_acc += pde_law_acc.item()
             n_batches += 1
         train_loss = running / max(1, n_batches)
         train_pred_loss = running_pred / max(1, n_batches)
         train_pde_loss = running_pde / max(1, n_batches)
+        train_pde_cont_loss = running_pde_cont / max(1, n_batches)
+        train_pde_law_loss = running_pde_law / max(1, n_batches)
+        train_pde_law_acc = running_pde_law_acc / max(1, n_batches)
 
         model.eval()
         with torch.no_grad():
             val_running = 0.0
             val_pred_running = 0.0
             val_pde_running = 0.0
+            val_pde_cont_running = 0.0
+            val_pde_law_running = 0.0
+            val_pde_law_acc_running = 0.0
             val_batches = 0
             for batch in val_loader:
                 pred, tgt, pred_pde, true_pde = predict_next(model, batch, cfg, device)
                 mask = batch["target_mask"].to(device) if cfg.mask_loss else None
                 pred_loss = weighted_masked_mse(pred, tgt, mask=mask)
                 if cfg.pde_aux_loss:
-                    pde_loss = torch.mean((pred_pde - true_pde) ** 2)
+                    pde_comp = pde_loss_components(
+                        pred_pde,
+                        true_pde,
+                        pde_schema,
+                        normalizer=pde_normalizer,
+                        normalize=cfg.pde_normalize,
+                        cont_weight=cfg.pde_cont_weight,
+                        law_weight=cfg.pde_law_weight,
+                    )
+                    pde_loss = pde_comp["total"]
+                    pde_cont_loss = pde_comp["continuous"]
+                    pde_law_loss = pde_comp["law"]
+                    pde_law_acc = pde_comp["law_accuracy"]
                     loss = pred_loss + cfg.pde_aux_weight * pde_loss
                 else:
                     pde_loss = torch.zeros((), dtype=pred_loss.dtype, device=pred_loss.device)
+                    pde_cont_loss = pde_loss
+                    pde_law_loss = pde_loss
+                    pde_law_acc = pde_loss
                     loss = pred_loss
                 val_running += loss.item()
                 val_pred_running += pred_loss.item()
                 val_pde_running += pde_loss.item()
+                val_pde_cont_running += pde_cont_loss.item()
+                val_pde_law_running += pde_law_loss.item()
+                val_pde_law_acc_running += pde_law_acc.item()
                 val_batches += 1
             val_loss = val_running / max(1, val_batches)
             val_pred_loss = val_pred_running / max(1, val_batches)
             val_pde_loss = val_pde_running / max(1, val_batches)
+            val_pde_cont_loss = val_pde_cont_running / max(1, val_batches)
+            val_pde_law_loss = val_pde_law_running / max(1, val_batches)
+            val_pde_law_acc = val_pde_law_acc_running / max(1, val_batches)
 
         epoch_time = time.time() - t0
         history["train_loss"].append(train_loss)
@@ -478,12 +593,21 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         history["val_pred_loss"].append(val_pred_loss)
         history["train_pde_loss"].append(train_pde_loss)
         history["val_pde_loss"].append(val_pde_loss)
+        history["train_pde_cont_loss"].append(train_pde_cont_loss)
+        history["val_pde_cont_loss"].append(val_pde_cont_loss)
+        history["train_pde_law_loss"].append(train_pde_law_loss)
+        history["val_pde_law_loss"].append(val_pde_law_loss)
+        history["train_pde_law_acc"].append(train_pde_law_acc)
+        history["val_pde_law_acc"].append(val_pde_law_acc)
         history["epoch_time"].append(epoch_time)
         history["lr"].append(float(optim.param_groups[0]["lr"]))
         print(
             f"[ep {epoch:3d}] train={train_loss:.4e} val={val_loss:.4e} "
             f"pred={train_pred_loss:.4e}/{val_pred_loss:.4e} "
             f"pde={train_pde_loss:.4e}/{val_pde_loss:.4e} "
+            f"cont={train_pde_cont_loss:.3e}/{val_pde_cont_loss:.3e} "
+            f"law={train_pde_law_loss:.3e}/{val_pde_law_loss:.3e} "
+            f"law_acc={train_pde_law_acc:.2f}/{val_pde_law_acc:.2f} "
             f"lr={history['lr'][-1]:.3e} t={epoch_time:.1f}s"
         )
 
@@ -517,6 +641,12 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         "final_val_pred_loss": history["val_pred_loss"][-1],
         "final_train_pde_loss": history["train_pde_loss"][-1],
         "final_val_pde_loss": history["val_pde_loss"][-1],
+        "final_train_pde_cont_loss": history["train_pde_cont_loss"][-1],
+        "final_val_pde_cont_loss": history["val_pde_cont_loss"][-1],
+        "final_train_pde_law_loss": history["train_pde_law_loss"][-1],
+        "final_val_pde_law_loss": history["val_pde_law_loss"][-1],
+        "final_train_pde_law_acc": history["train_pde_law_acc"][-1],
+        "final_val_pde_law_acc": history["val_pde_law_acc"][-1],
         "n_train_sims": len(train_paths),
         "n_val_sims": len(val_paths),
         "n_train_windows": len(train_ds),
@@ -534,7 +664,12 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         "input_noise_std": cfg.input_noise_std,
         "pde_aux_loss": cfg.pde_aux_loss,
         "pde_aux_weight": cfg.pde_aux_weight,
+        "pde_normalize": cfg.pde_normalize if cfg.pde_aux_loss else False,
+        "pde_cont_weight": cfg.pde_cont_weight,
+        "pde_law_weight": cfg.pde_law_weight,
         "pde_dim": cfg.pde_dim if cfg.pde_aux_loss else 0,
+        "pde_schema": pde_schema,
+        "pde_normalizer": pde_normalizer,
         "strides": parse_strides(cfg.strides),
     }
     save_json(out_dir / "metrics.json", metrics)
@@ -585,6 +720,15 @@ def main() -> None:
     ap.add_argument("--pde-aux-loss", action="store_true",
                     help="enable auxiliary pde_vec identification loss")
     ap.add_argument("--pde-aux-weight", type=float, default=0.01)
+    ap.add_argument("--pde-normalize", dest="pde_normalize", action="store_true",
+                    help="z-score continuous pde_vec targets using train-set statistics")
+    ap.add_argument("--no-pde-normalize", dest="pde_normalize", action="store_false",
+                    help="disable pde_vec normalization for the auxiliary loss")
+    ap.set_defaults(pde_normalize=True)
+    ap.add_argument("--pde-cont-weight", type=float, default=1.0,
+                    help="weight for continuous PDE regression inside the auxiliary loss")
+    ap.add_argument("--pde-law-weight", type=float, default=1.0,
+                    help="weight for viscosity-law classification inside the auxiliary loss")
     ap.add_argument("--pde-dim", type=int, default=0,
                     help="PDE auxiliary output dimension; inferred from pde_vec when 0")
     ap.add_argument("--use-derivatives", dest="use_derivatives", action="store_true")
@@ -601,6 +745,10 @@ def main() -> None:
         ap.error("--input-noise-std must be non-negative.")
     if args.pde_aux_weight < 0.0:
         ap.error("--pde-aux-weight must be non-negative.")
+    if args.pde_cont_weight < 0.0:
+        ap.error("--pde-cont-weight must be non-negative.")
+    if args.pde_law_weight < 0.0:
+        ap.error("--pde-law-weight must be non-negative.")
 
     cfg = TrainConfig(
         grid_dir=args.grid,
@@ -630,6 +778,9 @@ def main() -> None:
         mask_loss=args.mask_loss,
         pde_aux_loss=args.pde_aux_loss,
         pde_aux_weight=args.pde_aux_weight,
+        pde_normalize=args.pde_normalize,
+        pde_cont_weight=args.pde_cont_weight,
+        pde_law_weight=args.pde_law_weight,
         pde_dim=args.pde_dim,
         use_derivatives=args.use_derivatives,
         derivative_mode=args.derivative_mode,

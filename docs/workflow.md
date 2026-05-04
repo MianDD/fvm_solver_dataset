@@ -145,12 +145,20 @@ experiment from temporal context without changing the main next-state target:
 .\.venv\Scripts\python.exe -m ml.train --grid datasets\grid_local_smoke --out checkpoints\local_pde_aux `
   --epochs 2 --batch 1 --context 4 --horizon 1 --device cpu `
   --d-model 64 --heads 4 --layers 2 --patch 8 `
-  --pde-aux-loss --pde-aux-weight 0.01
+  --pde-aux-loss --pde-normalize --pde-aux-weight 0.01 `
+  --pde-cont-weight 1.0 --pde-law-weight 1.0
 ```
 
 If `--pde-aux-loss` is explicitly requested and a grid file lacks `pde_vec`, the
 trainer raises a clear error. Baseline training without the flag still works on
 old datasets.
+
+The PDE auxiliary loss is normalized by default because `pde_vec` mixes
+dimensionless values, tiny transport coefficients, temperature-scale values,
+one-hot viscosity-law entries, and `power_law_n`. Training-set-only mean/std are
+saved in the checkpoint. With the new 13D schema, continuous dimensions use
+normalized MSE while the viscosity-law slice uses cross entropy; old 9D
+`pde_vec` files use normalized MSE over all dimensions.
 
 The default attention path is the original flattened global Transformer:
 `--attention-type global`, so old commands and checkpoints remain compatible.
@@ -232,6 +240,19 @@ Evaluation reports one-step MSE, MAE, relative L2, per-channel errors, metrics
 grouped by family and stride, and rollout metrics when enough frames are
 available.
 
+If the checkpoint includes a PDE auxiliary head and the grid files include
+`pde_vec`, evaluation also writes `pde_metrics.json`:
+
+```powershell
+.\.venv\Scripts\python.exe -m ml.evaluate --grid datasets\grid_local_smoke `
+  --ckpt checkpoints\local_pde_aux\best_model.pt --out eval\local_pde_aux `
+  --device cpu --batch 1 --rollout-steps 4,8
+```
+
+The PDE metrics include continuous-parameter MAE/RMSE/R2 and, when the 13D
+schema is present, viscosity-law accuracy, per-class accuracy, and a confusion
+matrix.
+
 ## F. Plot Predictions
 
 ```powershell
@@ -244,6 +265,18 @@ Plots compare context final frame, target, prediction, and absolute error for
 `rho` and velocity magnitude. Filenames include simulation id, stride, step, and
 channel. Use `--stride N` to choose the plotted temporal stride; otherwise the
 first stride saved in the checkpoint is used.
+
+For Report 1 metric figures from `metrics.json` or `pde_metrics.json`:
+
+```powershell
+.\.venv\Scripts\python.exe -m ml.plot_report1_metrics `
+  --metrics eval\local_pde_aux\metrics.json `
+  --out figures\report1\local_pde_aux
+```
+
+This produces available plots such as `pde_r2_bar.png`, `pde_mae_bar.png`,
+`viscosity_law_confusion.png`, and `rollout_error.png`. Missing metric sections
+are skipped gracefully.
 
 ## Local Windows Smoke Test
 
