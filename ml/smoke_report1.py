@@ -30,7 +30,7 @@ from .pde import (
 )
 from .grid_adapter import pde_fingerprint, pde_fingerprint_names
 from .plot_report1_metrics import _plot_confusion
-from .train import pde_head_bias_from_normalizer, weighted_masked_mse
+from .train import TrainConfig, pde_head_bias_from_normalizer, train, weighted_masked_mse
 
 
 def _pde_vec_13(law_index: int) -> np.ndarray:
@@ -478,13 +478,69 @@ def main() -> None:
             raise RuntimeError("too-long synthetic context was not skipped")
         if not (root / "context_scaling" / "context_scaling_metrics.json").exists():
             raise RuntimeError("context scaling metrics JSON was not written")
+        baseline_train = train(
+            TrainConfig(
+                grid_dir=str(grid16),
+                out_dir=str(root / "train_baseline"),
+                context_length=3,
+                prediction_horizon=1,
+                n_epochs=1,
+                batch_size=2,
+                val_frac=0.5,
+                seed=7,
+                patch_size=8,
+                d_model=16,
+                n_heads=4,
+                n_layers=1,
+                attention_type="factorized",
+                pos_encoding="sinusoidal",
+                use_derivatives=False,
+                pushforward_prob=0.0,
+            ),
+            device="cpu",
+        )
+        if not np.isfinite(baseline_train["metrics"]["final_train_loss"]):
+            raise RuntimeError("baseline train smoke produced non-finite loss")
+        pushforward_train = train(
+            TrainConfig(
+                grid_dir=str(grid16),
+                out_dir=str(root / "train_pushforward"),
+                context_length=3,
+                prediction_horizon=1,
+                n_epochs=1,
+                batch_size=2,
+                val_frac=0.5,
+                seed=8,
+                patch_size=8,
+                d_model=16,
+                n_heads=4,
+                n_layers=1,
+                attention_type="factorized",
+                pos_encoding="sinusoidal",
+                use_derivatives=True,
+                use_mask_channel=True,
+                mask_loss=True,
+                pde_aux_loss=True,
+                pde_aux_weight=0.01,
+                pde_normalize=True,
+                pde_log_transport=True,
+                pde_cont_loss="huber",
+                pushforward_prob=0.5,
+            ),
+            device="cpu",
+        )
+        if not np.isfinite(pushforward_train["metrics"]["final_train_loss"]):
+            raise RuntimeError("pushforward train smoke produced non-finite loss")
+        if not (root / "train_pushforward" / "best_model.pt").exists():
+            raise RuntimeError("pushforward train smoke did not write best_model.pt")
         print(
             "OK synthetic report1 smoke: "
             f"windows={len(ds)} C_in={x.shape[2]} pred_loss={float(pred_loss.detach()):.4e} "
             f"pde_cont={float(pde_parts['continuous'].detach()):.4e} "
             f"pde_law={float(pde_parts['law'].detach()):.4e} "
             f"pde_eos={float(pde_parts['eos'].detach()):.4e} "
-            f"old9_loss={float(old_parts['total'].detach()):.4e}"
+            f"old9_loss={float(old_parts['total'].detach()):.4e} "
+            f"pushforward_loss={pushforward_train['metrics']['final_train_loss']:.4e}"
         )
     finally:
         shutil.rmtree(root, ignore_errors=True)

@@ -53,6 +53,9 @@ class TrainConfig:
     mlp_ratio: float = 4.0
     attention_type: str = "global"
     input_noise_std: float = 0.0
+    pushforward_prob: float = 0.0
+    rollout_train_steps: int = 1
+    rollout_train_weight_decay: float = 1.0
     pos_encoding: str = "learned_absolute"
     use_mask_channel: bool = False
     mask_loss: bool = False
@@ -178,6 +181,9 @@ def model_config_dict(cfg: TrainConfig, C_in: int, H: int, W: int) -> Dict:
         "mlp_ratio": cfg.mlp_ratio,
         "attention_type": cfg.attention_type,
         "pos_encoding": cfg.pos_encoding,
+        "pushforward_prob": cfg.pushforward_prob,
+        "rollout_train_steps": cfg.rollout_train_steps,
+        "rollout_train_weight_decay": cfg.rollout_train_weight_decay,
         "input_channel_names": _configured_input_channel_names(cfg),
         "target_channel_names": TARGET_CHANNEL_NAMES,
         "use_derivatives": cfg.use_derivatives,
@@ -319,12 +325,54 @@ def save_checkpoint(path: Path, model: FoundationCFDModel, optim, sched,
     }, path)
 
 
+def _maybe_apply_pushforward(
+    model: FoundationCFDModel,
+    features: torch.Tensor,
+    context_states: torch.Tensor,
+    dt: torch.Tensor,
+    cfg: TrainConfig,
+    training: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Detached one-step pushforward augmentation for rollout robustness.
+
+    The dataset feature layout always starts with the four physical channels
+    [V_x, V_y, rho, T].  Derivative features and the optional mask channel are
+    intentionally left unchanged after the replacement; this keeps the
+    augmentation cheap and makes it an approximate pushforward-noise regularizer
+    rather than a full feature-rebuild rollout.
+    """
+    if (not training) or cfg.pushforward_prob <= 0.0 or features.shape[1] < 2:
+        return features, context_states
+    if torch.rand((), device=features.device).item() >= cfg.pushforward_prob:
+        return features, context_states
+
+    with torch.no_grad():
+        prev_features = features[:, :-1]
+        prev_current = context_states[:, -2]
+        prev_update, _ = model.predict_update_and_pde(prev_features, normalised=False)
+        pseudo_update = prev_update[:, -1]
+        pseudo_state = model.integrate_update(
+            prev_current,
+            pseudo_update,
+            prediction_mode=cfg.prediction_mode,
+            integrator=cfg.integrator,
+            dt=dt,
+        ).detach()
+
+    n_phys = min(int(getattr(model, "C", len(TARGET_CHANNEL_NAMES))), features.shape[2], context_states.shape[2])
+    augmented_features = features.clone()
+    augmented_context = context_states.clone()
+    augmented_features[:, -1, :n_phys] = pseudo_state[:, :n_phys]
+    augmented_context[:, -1, :n_phys] = pseudo_state[:, :n_phys]
+    return augmented_features, augmented_context
+
+
 def predict_next(model: FoundationCFDModel, batch: Dict, cfg: TrainConfig,
                  device: str, training: bool = False) -> Tuple[
                      torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None
                  ]:
     features = batch["input_states"].to(device)
-    current = batch["context_states"][:, -1].to(device)
+    context_states = batch["context_states"].to(device)
     target = batch["target_states"][:, 0].to(device)
     dt = batch["dt"].to(device)
     if training and cfg.input_noise_std > 0.0:
@@ -336,6 +384,15 @@ def predict_next(model: FoundationCFDModel, batch: Dict, cfg: TrainConfig,
             channel_scale = channel_scale.clone()
             channel_scale[:, :, -1:] = 0.0
         features = features + cfg.input_noise_std * channel_scale * torch.randn_like(features)
+    features, context_states = _maybe_apply_pushforward(
+        model,
+        features,
+        context_states,
+        dt,
+        cfg,
+        training=training,
+    )
+    current = context_states[:, -1]
     update, pred_pde = model.predict_update_and_pde(features, normalised=False)
     update = update[:, -1]
     pred_next = model.integrate_update(
@@ -354,6 +411,17 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         raise ValueError(HORIZON_ERROR)
     if cfg.input_noise_std < 0.0:
         raise ValueError("--input-noise-std must be non-negative.")
+    if not 0.0 <= cfg.pushforward_prob <= 1.0:
+        raise ValueError("--pushforward-prob must be between 0 and 1.")
+    if cfg.rollout_train_steps < 1:
+        raise ValueError("--rollout-train-steps must be at least 1.")
+    if cfg.rollout_train_steps != 1:
+        raise ValueError(
+            "--rollout-train-steps > 1 is not implemented in this pass. "
+            "Use --pushforward-prob for rollout-stability augmentation."
+        )
+    if cfg.rollout_train_weight_decay < 0.0:
+        raise ValueError("--rollout-train-weight-decay must be non-negative.")
     if cfg.pde_aux_weight < 0.0:
         raise ValueError("--pde-aux-weight must be non-negative.")
     if cfg.pde_cont_weight < 0.0:
@@ -508,6 +576,22 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         if pde_class_counts:
             print(f"  pde_class_counts: {pde_class_counts}")
     print(f"Input noise std: {cfg.input_noise_std:g} normalizer-std units (training only)")
+    pushforward_active = cfg.pushforward_prob > 0.0 and cfg.context_length >= 2
+    print(
+        f"Pushforward augmentation: {'active' if pushforward_active else 'disabled'}  "
+        f"prob={cfg.pushforward_prob:g}  context={cfg.context_length}"
+    )
+    print(
+        "Rollout training loss: disabled "
+        f"(steps={cfg.rollout_train_steps}, weight_decay={cfg.rollout_train_weight_decay:g})"
+    )
+    if cfg.pushforward_prob > 0.0 and cfg.context_length < 2:
+        print("WARNING: --pushforward-prob requested but context length < 2; augmentation is disabled.")
+    if pushforward_active and cfg.use_derivatives:
+        print(
+            "NOTE: pushforward replaces only the last-frame physical channels; "
+            "derivative features are preserved as an approximate rollout-noise augmentation."
+        )
     attention_complexity = attention_complexity_dict(cfg, H, W)
     print_attention_complexity(attention_complexity)
 
@@ -819,6 +903,11 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         "attention_type": cfg.attention_type,
         "attention_complexity": attention_complexity,
         "input_noise_std": cfg.input_noise_std,
+        "pushforward_prob": cfg.pushforward_prob,
+        "pushforward_active": pushforward_active,
+        "rollout_train_steps": cfg.rollout_train_steps,
+        "rollout_train_weight_decay": cfg.rollout_train_weight_decay,
+        "rollout_train_active": False,
         "pde_aux_loss": cfg.pde_aux_loss,
         "pde_aux_weight": cfg.pde_aux_weight,
         "pde_normalize": cfg.pde_normalize if cfg.pde_aux_loss else False,
@@ -876,6 +965,12 @@ def main() -> None:
                     default="learned_absolute")
     ap.add_argument("--input-noise-std", type=float, default=0.0,
                     help="training-only Gaussian input noise in model-normalizer std units")
+    ap.add_argument("--pushforward-prob", type=float, default=0.0,
+                    help="training-only probability of replacing the last context state with a detached one-step model prediction")
+    ap.add_argument("--rollout-train-steps", type=int, default=1,
+                    help="reserved for future multi-step rollout loss; currently only 1 is supported")
+    ap.add_argument("--rollout-train-weight-decay", type=float, default=1.0,
+                    help="reserved rollout-loss step weighting; currently recorded but inactive while steps=1")
     ap.add_argument("--use-mask-channel", action="store_true",
                     help="append the static fluid mask as an input channel")
     ap.add_argument("--mask-loss", action="store_true",
@@ -919,6 +1014,14 @@ def main() -> None:
         ap.error(HORIZON_ERROR)
     if args.input_noise_std < 0.0:
         ap.error("--input-noise-std must be non-negative.")
+    if not 0.0 <= args.pushforward_prob <= 1.0:
+        ap.error("--pushforward-prob must be between 0 and 1.")
+    if args.rollout_train_steps < 1:
+        ap.error("--rollout-train-steps must be at least 1.")
+    if args.rollout_train_steps != 1:
+        ap.error("--rollout-train-steps > 1 is not implemented yet; use --pushforward-prob for this pass.")
+    if args.rollout_train_weight_decay < 0.0:
+        ap.error("--rollout-train-weight-decay must be non-negative.")
     if args.pde_aux_weight < 0.0:
         ap.error("--pde-aux-weight must be non-negative.")
     if args.pde_cont_weight < 0.0:
@@ -956,6 +1059,9 @@ def main() -> None:
         attention_type=args.attention_type,
         pos_encoding=args.pos_encoding,
         input_noise_std=args.input_noise_std,
+        pushforward_prob=args.pushforward_prob,
+        rollout_train_steps=args.rollout_train_steps,
+        rollout_train_weight_decay=args.rollout_train_weight_decay,
         use_mask_channel=args.use_mask_channel,
         mask_loss=args.mask_loss,
         pde_aux_loss=args.pde_aux_loss,

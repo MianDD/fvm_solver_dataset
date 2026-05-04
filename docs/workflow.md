@@ -247,6 +247,30 @@ applied during validation, evaluation, or plotting.
   --attention-type factorized --input-noise-std 0.005
 ```
 
+Pushforward augmentation is another training-only rollout-stability option. It
+is off by default with `--pushforward-prob 0.0`. With a value such as
+`--pushforward-prob 0.5`, the trainer uses the previous context to make a
+detached one-step model prediction, replaces only the last-frame physical
+channels `[V_x, V_y, rho, T]`, and then trains the normal next-state prediction
+from that perturbed context. This teaches recovery from the model's own one-step
+errors without changing validation, evaluation, plotting, or checkpoint loading.
+
+```powershell
+.\.venv\Scripts\python.exe -m ml.train --grid datasets\grid_local_smoke --out checkpoints\local_factorized_pushforward `
+  --epochs 1 --batch 1 --context 4 --horizon 1 --device cpu `
+  --d-model 64 --heads 4 --layers 2 --patch 8 `
+  --attention-type factorized --pos-encoding sinusoidal `
+  --prediction-mode derivative --integrator euler `
+  --use-derivatives --use-mask-channel --mask-loss `
+  --pushforward-prob 0.5
+```
+
+Derivative and mask channels are preserved rather than recomputed after the
+pushforward replacement, so this is an approximate pushforward-noise
+augmentation. The CLI also records `--rollout-train-steps` and
+`--rollout-train-weight-decay`, but multi-step rollout loss is deferred and
+`--rollout-train-steps` must currently remain `1`.
+
 `--horizon 1` and `--patch-t 1` are currently implemented. Larger temporal
 tubelets are the next architecture step because they require changing both
 tokenisation and detokenisation; this pass keeps the stable spatial patch

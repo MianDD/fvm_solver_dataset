@@ -242,6 +242,13 @@ Current model options:
 - `--input-noise-std 0.0` keeps deterministic baseline behavior
 - small `--input-noise-std` values such as `0.005` or `0.01` add training-only
   Gaussian input noise scaled by the fitted input normalizer std
+- `--pushforward-prob 0.0` keeps the original single-step training loop
+- `--pushforward-prob 0.5` enables a training-only rollout-stability
+  augmentation: the model predicts a detached one-step state from the previous
+  context and uses it to replace only the last-frame physical channels before
+  the final supervised prediction
+- `--rollout-train-steps` is reserved for future multi-step rollout loss and
+  currently must remain `1`
 
 Checkpoint output includes:
 
@@ -329,8 +336,14 @@ Example Report 1 training command:
   --use-derivatives --use-mask-channel --mask-loss `
   --pde-aux-loss --pde-normalize --pde-log-transport --pde-aux-weight 0.01 `
   --pde-cont-weight 1.0 --pde-law-weight 1.0 --pde-eos-weight 1.0 `
-  --pde-cont-loss huber --pde-huber-beta 1.0
+  --pde-cont-loss huber --pde-huber-beta 1.0 `
+  --pushforward-prob 0.5
 ```
+
+Pushforward training is off by default. When enabled, derivative and mask input
+channels are preserved rather than recomputed after the last physical frame is
+replaced, so it should be interpreted as a lightweight pushforward-noise
+augmentation rather than exact multi-step training.
 
 The solver now supports three shear-viscosity laws: `sutherland` (the original
 default), `constant`, and `power_law`. This is a first modular step toward
