@@ -174,7 +174,8 @@ experiment from temporal context without changing the main next-state target:
   --epochs 2 --batch 1 --context 4 --horizon 1 --device cpu `
   --d-model 64 --heads 4 --layers 2 --patch 8 `
   --pde-aux-loss --pde-normalize --pde-log-transport --pde-aux-weight 0.01 `
-  --pde-cont-weight 1.0 --pde-law-weight 1.0 --pde-eos-weight 1.0
+  --pde-cont-weight 1.0 --pde-law-weight 1.0 --pde-eos-weight 1.0 `
+  --pde-cont-loss huber --pde-huber-beta 1.0
 ```
 
 If `--pde-aux-loss` is explicitly requested and a grid file lacks `pde_vec`, the
@@ -186,11 +187,20 @@ dimensionless values, tiny transport coefficients, temperature-scale values,
 one-hot viscosity-law entries, and `power_law_n`. Training-set-only mean/std are
 saved in the checkpoint. Viscosity, bulk viscosity, and thermal conductivity are
 positive transport coefficients, so they are log-transformed before computing
-normalization statistics. With the new 16D schema, continuous dimensions use
-normalized MSE while the viscosity-law and EOS-type slices use cross entropy;
-`p_inf` is a continuous regression target. Old 13D `pde_vec` files still expose
-viscosity-law classification, and old 9D files use normalized MSE over all
-dimensions, with indices 1, 2, and 3 log-normalized by default.
+normalization statistics. With the new 16D schema, continuous dimensions use a
+robust normalized-space loss while the viscosity-law and EOS-type slices use
+cross entropy; `p_inf` is a continuous regression target. Old 13D `pde_vec`
+files still expose viscosity-law classification, and old 9D files use
+normalized continuous regression over all dimensions, with indices 1, 2, and 3
+log-normalized by default.
+
+For stability, near-constant continuous dimensions are skipped using train-set
+transformed standard deviation. `power_law_n` contributes only for samples whose
+viscosity law is `power_law`, and `p_inf` contributes only for `stiffened_gas`
+samples. The default is `--pde-cont-loss huber`; `--pde-cont-loss mse` is
+available for ablations. Law/EOS accuracy on single-class datasets is
+degenerate: ID-only data has only `sutherland` and `ideal`, so those accuracies
+should not be reported as PDE-form identification.
 
 The default attention path is the original flattened global Transformer:
 `--attention-type global`, so old commands and checkpoints remain compatible.
@@ -415,6 +425,8 @@ Submit the templates in `scripts/` after replacing `YOUR_PROJECT`:
 sbatch scripts/csd3_sweep.slurm
 sbatch scripts/csd3_sweep_fixed_tiny.slurm
 sbatch scripts/csd3_sweep_fixed_id20.slurm
+sbatch scripts/csd3_sweep_fixed_ood_mild.slurm
+sbatch scripts/csd3_sweep_fixed_ood_hard.slurm
 sbatch scripts/csd3_grid.slurm
 sbatch scripts/csd3_train_cpu.slurm
 sbatch scripts/csd3_train_gpu.slurm

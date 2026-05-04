@@ -30,7 +30,7 @@ from .pde import (
 )
 from .grid_adapter import pde_fingerprint, pde_fingerprint_names
 from .plot_report1_metrics import _plot_confusion
-from .train import weighted_masked_mse
+from .train import pde_head_bias_from_normalizer, weighted_masked_mse
 
 
 def _pde_vec_13(law_index: int) -> np.ndarray:
@@ -114,6 +114,60 @@ def _realistic_pde_vectors(n: int = 96) -> np.ndarray:
     return vectors.astype(np.float32)
 
 
+def _realistic_pde_vectors_id(n: int = 64) -> np.ndarray:
+    rng = np.random.default_rng(322)
+    one_hot = np.zeros((n, 3), dtype=np.float32)
+    one_hot[:, 0] = 1.0
+    eos_one_hot = np.zeros((n, 2), dtype=np.float32)
+    eos_one_hot[:, 0] = 1.0
+    vectors = np.column_stack([
+        rng.uniform(1.22, 1.36, size=n),
+        10 ** rng.uniform(np.log10(8e-4), np.log10(3e-3), size=n),
+        10 ** rng.uniform(np.log10(2e-3), np.log10(1.2e-2), size=n),
+        10 ** rng.uniform(np.log10(5e-7), np.log10(5e-6), size=n),
+        rng.uniform(1.8, 2.8, size=n),
+        rng.uniform(90.0, 110.0, size=n),
+        rng.uniform(0.9, 1.1, size=n),
+        rng.uniform(90.0, 110.0, size=n),
+        rng.uniform(4.0, 7.0, size=n),
+        one_hot,
+        np.full((n, 1), 0.75, dtype=np.float32),
+        eos_one_hot,
+        np.zeros((n, 1), dtype=np.float32),
+    ])
+    return vectors.astype(np.float32)
+
+
+def _realistic_pde_vectors_ood_mild(n: int = 96) -> np.ndarray:
+    rng = np.random.default_rng(323)
+    laws = np.arange(n) % 3
+    one_hot = np.zeros((n, 3), dtype=np.float32)
+    one_hot[np.arange(n), laws] = 1.0
+    power_law_n = np.full(n, 0.75, dtype=np.float32)
+    power_law_n[laws == 2] = rng.uniform(0.55, 0.95, size=int(np.sum(laws == 2)))
+    eos_classes = np.arange(n) % 2
+    eos_one_hot = np.zeros((n, 2), dtype=np.float32)
+    eos_one_hot[np.arange(n), eos_classes] = 1.0
+    p_inf = np.zeros(n, dtype=np.float32)
+    p_inf[eos_classes == 1] = rng.uniform(1.0, 100.0, size=int(np.sum(eos_classes == 1)))
+    vectors = np.column_stack([
+        rng.uniform(1.36, 1.45, size=n),
+        10 ** rng.uniform(np.log10(3e-3), np.log10(5e-3), size=n),
+        10 ** rng.uniform(np.log10(8e-3), np.log10(2e-2), size=n),
+        10 ** rng.uniform(np.log10(4e-6), np.log10(9e-6), size=n),
+        rng.uniform(1.6, 3.0, size=n),
+        rng.uniform(85.0, 115.0, size=n),
+        rng.uniform(0.85, 1.15, size=n),
+        rng.uniform(85.0, 115.0, size=n),
+        rng.uniform(7.0, 8.5, size=n),
+        one_hot,
+        power_law_n.reshape(n, 1),
+        eos_one_hot,
+        p_inf.reshape(n, 1),
+    ])
+    return vectors.astype(np.float32)
+
+
 def _stress_pde_normalizer() -> None:
     vectors = _realistic_pde_vectors()
     schema = infer_pde_schema(DEFAULT_PDE_VEC_NAMES, vectors.shape[1])
@@ -151,6 +205,63 @@ def _stress_pde_normalizer() -> None:
     perturb_loss = float(perturbed_parts["continuous"].detach())
     if not np.isfinite(perturb_loss) or perturb_loss > 0.5:
         raise RuntimeError(f"5% transport perturbation produced exploding loss: {perturb_loss}")
+
+
+def _stress_robust_continuous_loss() -> None:
+    for name, vectors in {
+        "id": _realistic_pde_vectors_id(),
+        "ood_mild": _realistic_pde_vectors_ood_mild(),
+    }.items():
+        schema = infer_pde_schema(DEFAULT_PDE_VEC_NAMES, vectors.shape[1])
+        normalizer = compute_pde_normalizer(vectors, names=DEFAULT_PDE_VEC_NAMES)
+        if not normalizer.get("active_continuous_indices"):
+            raise RuntimeError(f"{name} normalizer has no active continuous indices")
+        if name == "id":
+            skipped = set(normalizer.get("skipped_continuous_names", []))
+            if {"power_law_n", "p_inf"} - skipped:
+                raise RuntimeError(f"ID should skip meaningless constant dimensions, got {skipped}")
+
+        mean_bias = pde_head_bias_from_normalizer(normalizer).numpy()
+        mean_pred = np.repeat(mean_bias[None, :], vectors.shape[0], axis=0).astype(np.float32)
+        mean_parts = pde_loss_components(
+            torch.from_numpy(mean_pred),
+            torch.from_numpy(vectors),
+            schema,
+            normalizer=normalizer,
+            normalize=True,
+        )
+        mean_loss = float(mean_parts["continuous"].detach())
+        if not np.isfinite(mean_loss) or mean_loss > 5.0:
+            raise RuntimeError(f"{name} mean predictor continuous loss unstable: {mean_loss}")
+        if float(mean_parts["cont_num_active_dims"]) <= 0 or float(mean_parts["cont_num_valid_entries"]) <= 0:
+            raise RuntimeError(f"{name} continuous loss reported no active/valid entries")
+
+        rng = np.random.default_rng(324)
+        perturbed = mean_pred.copy()
+        perturbed += rng.normal(scale=0.02, size=perturbed.shape).astype(np.float32)
+        perturbed[:, 1:4] *= rng.uniform(0.95, 1.05, size=(perturbed.shape[0], 3)).astype(np.float32)
+        # These dimensions are conditionally meaningful. Extreme mistakes on
+        # irrelevant samples must not dominate the loss.
+        non_power = vectors[:, 11] < 0.5
+        ideal = vectors[:, 13] > 0.5
+        perturbed[non_power, 12] = 999.0
+        perturbed[ideal, 15] = 999.0
+        parts = pde_loss_components(
+            torch.from_numpy(perturbed),
+            torch.from_numpy(vectors),
+            schema,
+            normalizer=normalizer,
+            normalize=True,
+        )
+        cont_loss = float(parts["continuous"].detach())
+        if not np.isfinite(cont_loss) or cont_loss >= 50.0:
+            raise RuntimeError(f"{name} robust continuous loss exploded: {cont_loss}")
+        if name == "ood_mild":
+            max_possible = len(normalizer.get("active_continuous_indices", [])) * vectors.shape[0]
+            if float(parts["cont_num_valid_entries"]) >= max_possible:
+                raise RuntimeError("OOD conditional dimensions did not reduce valid continuous entries")
+        if not torch.isfinite(parts["law"]) or not torch.isfinite(parts["eos"]):
+            raise RuntimeError(f"{name} categorical PDE losses were not finite")
 
 
 def _test_pde_schema_and_fingerprint() -> None:
@@ -201,6 +312,7 @@ def main() -> None:
     try:
         _test_pde_schema_and_fingerprint()
         _stress_pde_normalizer()
+        _stress_robust_continuous_loss()
         grid16 = root / "grid16"
         grid13 = root / "grid13"
         grid9 = root / "grid9"
@@ -248,10 +360,13 @@ def main() -> None:
         )
         with torch.no_grad():
             model.pde_head[-1].weight.zero_()
-            model.pde_head[-1].bias.copy_(torch.as_tensor(pde_normalizer["raw_mean"], dtype=torch.float32))
+            model.pde_head[-1].bias.copy_(pde_head_bias_from_normalizer(pde_normalizer))
         update, pde_pred = model.predict_update_and_pde(x)
         pred = model.integrate_update(batch["context_states"][-1].unsqueeze(0), update[:, -1])
         pred_loss = weighted_masked_mse(pred, target, mask=mask)
+        zero_mask_loss = weighted_masked_mse(pred, target, mask=torch.zeros_like(mask))
+        if not torch.isfinite(zero_mask_loss) or float(zero_mask_loss.detach()) != 0.0:
+            raise RuntimeError("weighted_masked_mse should return finite zero for an all-zero mask")
         pde_parts = pde_loss_components(
             pde_pred,
             pde,

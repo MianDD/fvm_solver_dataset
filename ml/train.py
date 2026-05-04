@@ -64,6 +64,8 @@ class TrainConfig:
     pde_cont_weight: float = 1.0
     pde_law_weight: float = 1.0
     pde_eos_weight: float = 1.0
+    pde_cont_loss: str = "huber"
+    pde_huber_beta: float = 1.0
     pde_dim: int = 0
     num_workers: int = 0
     save_every: int = 0
@@ -97,6 +99,8 @@ def weighted_masked_mse(pred: torch.Tensor, true: torch.Tensor,
     if mask.dim() != 4:
         raise ValueError(f"mask must have shape (B,H,W) or (B,1,H,W), got {tuple(mask.shape)}")
     denom = mask.sum() * pred.shape[1]
+    if bool(denom.detach().cpu().item() <= 0):
+        return err.sum() * 0.0
     return (err * mask).sum() / denom.clamp_min(1.0)
 
 
@@ -191,6 +195,8 @@ def model_config_dict(cfg: TrainConfig, C_in: int, H: int, W: int) -> Dict:
         "pde_cont_weight": cfg.pde_cont_weight,
         "pde_law_weight": cfg.pde_law_weight,
         "pde_eos_weight": cfg.pde_eos_weight,
+        "pde_cont_loss": cfg.pde_cont_loss,
+        "pde_huber_beta": cfg.pde_huber_beta,
         "pde_dim": cfg.pde_dim if cfg.pde_aux_loss else 0,
         "strides": parse_strides(cfg.strides),
     }
@@ -234,6 +240,55 @@ def print_attention_complexity(complexity: Dict) -> None:
     )
 
 
+def pde_categorical_class_counts(vectors: np.ndarray, schema: Dict,
+                                 indices_key: str, names_key: str) -> Dict:
+    indices = [int(i) for i in schema.get(indices_key, [])]
+    names = [str(name) for name in schema.get(names_key, [])]
+    if not indices:
+        return {}
+    values = np.asarray(vectors, dtype=np.float32)
+    if values.ndim != 2 or any(idx >= values.shape[1] for idx in indices):
+        return {}
+    classes = values[:, indices].argmax(axis=1)
+    counts = {
+        name: int(np.sum(classes == i))
+        for i, name in enumerate(names)
+    }
+    present = [name for name, count in counts.items() if count > 0]
+    return {
+        "indices": indices,
+        "names": names,
+        "counts": counts,
+        "num_classes_present": len(present),
+        "present_classes": present,
+        "degenerate": len(present) <= 1,
+    }
+
+
+def _warn_if_single_class(label: str, counts: Dict) -> None:
+    if not counts or not counts.get("degenerate"):
+        return
+    present = counts.get("present_classes", [])
+    class_name = present[0] if present else "none"
+    metric = "law_accuracy" if label == "viscosity-law" else "eos_accuracy"
+    print(
+        f"WARNING: training set contains only one {label} class: {class_name}. "
+        f"{metric} will be trivial and should not be reported as PDE-form "
+        "identification. Use ood_mild/mixed data for this metric."
+    )
+
+
+def pde_head_bias_from_normalizer(pde_normalizer: Dict) -> torch.Tensor:
+    """Initialise raw-space head bias so transformed bias is near train mean."""
+    raw_mean = list(pde_normalizer.get("raw_mean", pde_normalizer.get("mean", [])))
+    transformed_mean = pde_normalizer.get("mean", raw_mean)
+    log_eps = float(pde_normalizer.get("log_eps", 1e-12))
+    for idx in [int(i) for i in pde_normalizer.get("log_indices", [])]:
+        if 0 <= idx < len(raw_mean) and idx < len(transformed_mean):
+            raw_mean[idx] = max(float(np.exp(float(transformed_mean[idx]))), log_eps)
+    return torch.as_tensor(raw_mean, dtype=torch.float32)
+
+
 def save_json(path: Path, payload: Dict) -> None:
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -260,6 +315,7 @@ def save_checkpoint(path: Path, model: FoundationCFDModel, optim, sched,
         },
         "pde_schema": model_config.get("pde_schema", {}),
         "pde_normalizer": model_config.get("pde_normalizer"),
+        "pde_class_counts": model_config.get("pde_class_counts", {}),
     }, path)
 
 
@@ -306,6 +362,10 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         raise ValueError("--pde-law-weight must be non-negative.")
     if cfg.pde_eos_weight < 0.0:
         raise ValueError("--pde-eos-weight must be non-negative.")
+    if cfg.pde_cont_loss not in {"mse", "huber"}:
+        raise ValueError("--pde-cont-loss must be either 'mse' or 'huber'.")
+    if cfg.pde_huber_beta <= 0.0:
+        raise ValueError("--pde-huber-beta must be positive.")
     if cfg.pde_log_eps <= 0.0:
         raise ValueError("--pde-log-eps must be positive.")
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -348,6 +408,7 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         print("WARNING: mask channel requested but one or more grid files lack masks; missing masks use all-fluid defaults.")
     pde_schema: Dict = {}
     pde_normalizer: Dict | None = None
+    pde_class_counts: Dict = {}
     if cfg.pde_aux_loss:
         if not (train_ds.has_pde_vec and val_ds.has_pde_vec):
             raise RuntimeError("--pde-aux-loss requested but at least one grid file is missing pde_vec.")
@@ -362,12 +423,28 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         if cfg.pde_dim != inferred_pde_dim:
             raise RuntimeError(f"--pde-dim={cfg.pde_dim} does not match dataset pde_vec length {inferred_pde_dim}.")
         pde_schema = infer_pde_schema(train_ds.pde_vec_names, cfg.pde_dim)
+        pde_vectors = pde_vectors_from_records(train_ds._cache)
+        pde_class_counts = {
+            "viscosity_law": pde_categorical_class_counts(
+                pde_vectors,
+                pde_schema,
+                "viscosity_law_indices",
+                "viscosity_law_names",
+            ),
+            "eos_type": pde_categorical_class_counts(
+                pde_vectors,
+                pde_schema,
+                "eos_type_indices",
+                "eos_type_names",
+            ),
+        }
+        _warn_if_single_class("viscosity-law", pde_class_counts["viscosity_law"])
+        _warn_if_single_class("EOS", pde_class_counts["eos_type"])
         if cfg.pde_normalize:
             if resume_ckpt is not None and resume_ckpt.get("pde_normalizer"):
                 pde_normalizer = resume_ckpt["pde_normalizer"]
                 print("Loaded PDE auxiliary normalizer from resume checkpoint.")
             else:
-                pde_vectors = pde_vectors_from_records(train_ds._cache)
                 pde_normalizer = compute_pde_normalizer(
                     pde_vectors,
                     min_std=1e-6,
@@ -423,6 +500,13 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
             log_indices = [int(i) for i in pde_normalizer.get("log_indices", [])]
             log_names = [pde_schema.get("pde_vec_names", [])[i] for i in log_indices]
             print(f"  pde_log_indices: {log_indices}  names={log_names}  eps={pde_normalizer.get('log_eps')}")
+            print(
+                "  pde_active_continuous: "
+                f"{pde_normalizer.get('active_continuous_indices', [])}  "
+                f"skipped={pde_normalizer.get('skipped_continuous_names', [])}"
+            )
+        if pde_class_counts:
+            print(f"  pde_class_counts: {pde_class_counts}")
     print(f"Input noise std: {cfg.input_noise_std:g} normalizer-std units (training only)")
     attention_complexity = attention_complexity_dict(cfg, H, W)
     print_attention_complexity(attention_complexity)
@@ -431,14 +515,14 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
     if cfg.pde_aux_loss and pde_normalizer is not None and model.pde_head is not None and not cfg.resume:
         with torch.no_grad():
             model.pde_head[-1].weight.zero_()
-            bias_values = pde_normalizer.get("raw_mean", pde_normalizer["mean"])
-            bias = torch.as_tensor(bias_values, dtype=torch.float32, device=device)
+            bias = pde_head_bias_from_normalizer(pde_normalizer).to(device)
             model.pde_head[-1].bias.copy_(bias)
     model_cfg = model_config_dict(cfg, C_in, H, W)
     model_cfg["physical_derivative_spacing"] = "physical" if physical_spacing_used else "index_or_unused"
     model_cfg["attention_complexity"] = attention_complexity
     model_cfg["pde_schema"] = pde_schema
     model_cfg["pde_normalizer"] = pde_normalizer
+    model_cfg["pde_class_counts"] = pde_class_counts
     save_json(out_dir / "model_config.json", model_cfg)
     if cfg.pde_aux_loss:
         save_json(out_dir / "pde_normalizer.json", {
@@ -450,6 +534,9 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
             "pde_cont_weight": cfg.pde_cont_weight,
             "pde_law_weight": cfg.pde_law_weight,
             "pde_eos_weight": cfg.pde_eos_weight,
+            "pde_cont_loss": cfg.pde_cont_loss,
+            "pde_huber_beta": cfg.pde_huber_beta,
+            "pde_class_counts": pde_class_counts,
         })
     print(f"Model params: {count_params(model):,}")
 
@@ -544,6 +631,8 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
                     cont_weight=cfg.pde_cont_weight,
                     law_weight=cfg.pde_law_weight,
                     eos_weight=cfg.pde_eos_weight,
+                    cont_loss_mode=cfg.pde_cont_loss,
+                    huber_beta=cfg.pde_huber_beta,
                 )
                 pde_loss = pde_comp["total"]
                 pde_cont_loss = pde_comp["continuous"]
@@ -608,6 +697,8 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
                         cont_weight=cfg.pde_cont_weight,
                         law_weight=cfg.pde_law_weight,
                         eos_weight=cfg.pde_eos_weight,
+                        cont_loss_mode=cfg.pde_cont_loss,
+                        huber_beta=cfg.pde_huber_beta,
                     )
                     pde_loss = pde_comp["total"]
                     pde_cont_loss = pde_comp["continuous"]
@@ -736,9 +827,12 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         "pde_cont_weight": cfg.pde_cont_weight,
         "pde_law_weight": cfg.pde_law_weight,
         "pde_eos_weight": cfg.pde_eos_weight,
+        "pde_cont_loss": cfg.pde_cont_loss,
+        "pde_huber_beta": cfg.pde_huber_beta,
         "pde_dim": cfg.pde_dim if cfg.pde_aux_loss else 0,
         "pde_schema": pde_schema,
         "pde_normalizer": pde_normalizer,
+        "pde_class_counts": pde_class_counts,
         "strides": parse_strides(cfg.strides),
     }
     save_json(out_dir / "metrics.json", metrics)
@@ -807,6 +901,10 @@ def main() -> None:
                     help="weight for viscosity-law classification inside the auxiliary loss")
     ap.add_argument("--pde-eos-weight", type=float, default=1.0,
                     help="weight for EOS-type classification inside the auxiliary loss")
+    ap.add_argument("--pde-cont-loss", choices=["mse", "huber"], default="huber",
+                    help="robust loss for normalized continuous PDE regression")
+    ap.add_argument("--pde-huber-beta", type=float, default=1.0,
+                    help="Huber beta in normalized PDE space when --pde-cont-loss huber")
     ap.add_argument("--pde-dim", type=int, default=0,
                     help="PDE auxiliary output dimension; inferred from pde_vec when 0")
     ap.add_argument("--use-derivatives", dest="use_derivatives", action="store_true")
@@ -829,6 +927,8 @@ def main() -> None:
         ap.error("--pde-law-weight must be non-negative.")
     if args.pde_eos_weight < 0.0:
         ap.error("--pde-eos-weight must be non-negative.")
+    if args.pde_huber_beta <= 0.0:
+        ap.error("--pde-huber-beta must be positive.")
     if args.pde_log_eps <= 0.0:
         ap.error("--pde-log-eps must be positive.")
 
@@ -866,6 +966,8 @@ def main() -> None:
         pde_cont_weight=args.pde_cont_weight,
         pde_law_weight=args.pde_law_weight,
         pde_eos_weight=args.pde_eos_weight,
+        pde_cont_loss=args.pde_cont_loss,
+        pde_huber_beta=args.pde_huber_beta,
         pde_dim=args.pde_dim,
         use_derivatives=args.use_derivatives,
         derivative_mode=args.derivative_mode,

@@ -232,6 +232,8 @@ Current model options:
 - `--pde-cont-weight`, `--pde-law-weight`, and `--pde-eos-weight` weight the
   continuous-parameter regression, viscosity-law classification, and EOS-type
   classification terms inside the auxiliary loss
+- `--pde-cont-loss huber` is the default robust continuous PDE loss in
+  normalized space; use `--pde-cont-loss mse` only for ablations
 - `--pos-encoding learned_absolute` is the default checkpoint-compatible
   position embedding; `--pos-encoding sinusoidal` is parameter-free and less
   tied to learned position-table sizes
@@ -305,8 +307,17 @@ relative transport-coefficient errors more meaningful. For newly generated 16D
 grids, the viscosity-law and EOS one-hot slices are treated as classification
 logits and trained with cross entropy; `p_inf` remains a continuous regression
 target. Old 13D `pde_vec` files still provide viscosity-law classification, and
-old 9D files fall back to normalized MSE over all dimensions, with the same
-log-space treatment for indices 1, 2, and 3.
+old 9D files fall back to normalized continuous regression over all dimensions,
+with the same log-space treatment for indices 1, 2, and 3.
+
+The continuous PDE auxiliary loss is deliberately conservative for stability.
+Near-constant continuous dimensions are skipped using train-set transformed
+standard deviation, `power_law_n` is supervised only on `power_law` samples, and
+`p_inf` is supervised only on `stiffened_gas` samples. The default continuous
+loss is Huber in normalized PDE space, which avoids thousands-scale losses from
+tiny-variance or conditionally meaningless dimensions. Categorical accuracies
+are marked/warned as degenerate when the training or evaluation set contains
+only one class; ID-only data has trivial viscosity-law and EOS accuracy.
 
 Example Report 1 training command:
 
@@ -317,7 +328,8 @@ Example Report 1 training command:
   --attention-type factorized --prediction-mode derivative --integrator euler `
   --use-derivatives --use-mask-channel --mask-loss `
   --pde-aux-loss --pde-normalize --pde-log-transport --pde-aux-weight 0.01 `
-  --pde-cont-weight 1.0 --pde-law-weight 1.0 --pde-eos-weight 1.0
+  --pde-cont-weight 1.0 --pde-law-weight 1.0 --pde-eos-weight 1.0 `
+  --pde-cont-loss huber --pde-huber-beta 1.0
 ```
 
 The solver now supports three shear-viscosity laws: `sutherland` (the original
@@ -414,6 +426,8 @@ Core workflow templates:
 
 - `scripts/csd3_sweep_fixed_tiny.slurm`
 - `scripts/csd3_sweep_fixed_id20.slurm`
+- `scripts/csd3_sweep_fixed_ood_mild.slurm`
+- `scripts/csd3_sweep_fixed_ood_hard.slurm`
 - `scripts/csd3_grid.slurm`
 - `scripts/csd3_train_cpu.slurm`
 - `scripts/csd3_train_gpu.slurm`
@@ -442,6 +456,8 @@ Typical CSD3 sequence after syncing the repo:
 cd ~/rds/hpc-work/fvm_solver_dataset
 source .venv/bin/activate
 sbatch scripts/csd3_sweep_fixed_id20.slurm
+sbatch scripts/csd3_sweep_fixed_ood_mild.slurm
+sbatch scripts/csd3_sweep_fixed_ood_hard.slurm
 sbatch scripts/csd3_grid.slurm
 sbatch scripts/csd3_train_id20_global_cmp.slurm
 sbatch scripts/csd3_train_id20_factorized_cmp.slurm
