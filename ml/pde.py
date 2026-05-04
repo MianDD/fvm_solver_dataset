@@ -24,6 +24,8 @@ VISCOSITY_LAW_NAMES = ["sutherland", "constant", "power_law"]
 VISCOSITY_LAW_VEC_NAMES = [f"viscosity_law_{name}" for name in VISCOSITY_LAW_NAMES]
 POWER_LAW_N_NAME = "power_law_n"
 DEFAULT_PDE_VEC_NAMES = BASE_PDE_NAMES + VISCOSITY_LAW_VEC_NAMES + [POWER_LAW_N_NAME]
+DEFAULT_LOG_PDE_NAMES = ["viscosity", "visc_bulk", "thermal_cond"]
+DEFAULT_LOG_INDICES = [1, 2, 3]
 
 
 def default_pde_names(dim: int) -> List[str]:
@@ -73,6 +75,20 @@ def infer_pde_schema(names: Sequence[str] | None = None,
     }
 
 
+def default_log_indices(names: Sequence[str] | None = None,
+                        pde_dim: int | None = None) -> List[int]:
+    """Return default log-transform dimensions for transport coefficients."""
+    if names:
+        vec_names = [str(name) for name in names]
+        indices = [vec_names.index(name) for name in DEFAULT_LOG_PDE_NAMES if name in vec_names]
+        if indices:
+            return indices
+        dim = len(vec_names)
+    else:
+        dim = int(pde_dim or 0)
+    return [idx for idx in DEFAULT_LOG_INDICES if idx < dim]
+
+
 def pde_vectors_from_records(records: Iterable[Dict]) -> np.ndarray:
     vectors = [
         np.asarray(rec["pde_vec"], dtype=np.float32)
@@ -84,17 +100,64 @@ def pde_vectors_from_records(records: Iterable[Dict]) -> np.ndarray:
     return np.stack(vectors, axis=0).astype(np.float32)
 
 
-def compute_pde_normalizer(vectors: np.ndarray, min_std: float = 1e-6) -> Dict:
+def transform_pde_vectors_np(vectors: np.ndarray,
+                             log_indices: Sequence[int] | None = None,
+                             log_eps: float = 1e-12) -> np.ndarray:
+    """Apply the stored PDE-space transform to numpy arrays.
+
+    Transport coefficients are positive and span orders of magnitude, so the
+    default normalizer works in log-space for those dimensions.
+    """
+    out = np.asarray(vectors, dtype=np.float32).copy()
+    if out.ndim == 1:
+        out = out[None, :]
+    for idx in [int(i) for i in (log_indices or []) if int(i) < out.shape[1]]:
+        out[:, idx] = np.log(np.maximum(out[:, idx], float(log_eps)))
+    return out.astype(np.float32)
+
+
+def transform_pde_tensor(values: torch.Tensor,
+                         normalizer: Dict | None = None) -> torch.Tensor:
+    """Apply a checkpoint-compatible PDE transform to a torch tensor."""
+    if normalizer is None:
+        return values
+    log_indices = [int(i) for i in normalizer.get("log_indices", [])]
+    if not log_indices:
+        return values
+    out = values.clone()
+    log_eps = float(normalizer.get("log_eps", 1e-12))
+    valid = [idx for idx in log_indices if idx < out.shape[1]]
+    if valid:
+        idx_t = torch.as_tensor(valid, dtype=torch.long, device=out.device)
+        logged = torch.log(out.index_select(1, idx_t).clamp_min(log_eps))
+        out.index_copy_(1, idx_t, logged)
+    return out
+
+
+def compute_pde_normalizer(vectors: np.ndarray, min_std: float = 1e-6,
+                           log_indices: Sequence[int] | None = None,
+                           log_eps: float = 1e-12,
+                           log_transport: bool = True,
+                           names: Sequence[str] | None = None) -> Dict:
     vectors = np.asarray(vectors, dtype=np.float32)
     if vectors.ndim != 2 or vectors.shape[0] == 0:
         raise ValueError("Cannot compute PDE normalizer from an empty vector set.")
-    mean = vectors.mean(axis=0).astype(np.float32)
-    std = vectors.std(axis=0).astype(np.float32)
+    if log_indices is None:
+        log_indices = default_log_indices(names, vectors.shape[1]) if log_transport else []
+    log_indices = [int(i) for i in log_indices if 0 <= int(i) < vectors.shape[1]]
+    transformed = transform_pde_vectors_np(vectors, log_indices=log_indices, log_eps=log_eps)
+    mean = transformed.mean(axis=0).astype(np.float32)
+    std = transformed.std(axis=0).astype(np.float32)
     std = np.maximum(std, float(min_std)).astype(np.float32)
     return {
         "mean": mean.tolist(),
         "std": std.tolist(),
+        "raw_mean": vectors.mean(axis=0).astype(np.float32).tolist(),
+        "raw_std": np.maximum(vectors.std(axis=0).astype(np.float32), float(min_std)).tolist(),
         "min_std": float(min_std),
+        "log_indices": log_indices,
+        "log_eps": float(log_eps),
+        "transform": "log_transport" if log_indices else "identity",
         "n_train_vectors": int(vectors.shape[0]),
     }
 
@@ -128,6 +191,10 @@ def pde_loss_components(pred: torch.Tensor,
         pred_cont = pred.index_select(1, idx)
         true_cont = true.index_select(1, idx)
         if normalize and normalizer is not None:
+            pred_t = transform_pde_tensor(pred, normalizer)
+            true_t = transform_pde_tensor(true, normalizer)
+            pred_cont = pred_t.index_select(1, idx)
+            true_cont = true_t.index_select(1, idx)
             mean = torch.as_tensor(normalizer["mean"], dtype=pred.dtype, device=pred.device).index_select(0, idx)
             std = torch.as_tensor(normalizer["std"], dtype=pred.dtype, device=pred.device).index_select(0, idx)
             pred_cont = (pred_cont - mean.view(1, -1)) / std.view(1, -1).clamp_min(1e-6)
@@ -185,18 +252,38 @@ def compute_pde_metrics(pred: np.ndarray,
     r2s: List[float] = []
     nmaes: List[float] = []
     norm_std = None
+    log_indices = set()
+    pred_transformed = pred
+    true_transformed = true
     if normalizer is not None and "std" in normalizer:
         norm_std = np.asarray(normalizer["std"], dtype=np.float64)
+        log_indices = {int(i) for i in normalizer.get("log_indices", [])}
+        pred_transformed = transform_pde_vectors_np(
+            pred,
+            log_indices=sorted(log_indices),
+            log_eps=float(normalizer.get("log_eps", 1e-12)),
+        ).astype(np.float64)
+        true_transformed = transform_pde_vectors_np(
+            true,
+            log_indices=sorted(log_indices),
+            log_eps=float(normalizer.get("log_eps", 1e-12)),
+        ).astype(np.float64)
+    continuous["log_indices"] = sorted(int(i) for i in log_indices if i in cont_indices)
+    continuous["r2_space"] = "mixed_raw_log" if log_indices else "raw"
 
     for i in cont_indices:
         err = pred[:, i] - true[:, i]
         mae = float(np.mean(np.abs(err)))
         rmse = float(np.sqrt(np.mean(err ** 2)))
-        denom = float(np.sum((true[:, i] - np.mean(true[:, i])) ** 2))
-        r2 = None if denom <= 1e-12 else _float_or_none(1.0 - float(np.sum(err ** 2)) / denom)
+        metric_pred = pred_transformed[:, i] if i in log_indices else pred[:, i]
+        metric_true = true_transformed[:, i] if i in log_indices else true[:, i]
+        metric_err = metric_pred - metric_true
+        denom = float(np.sum((metric_true - np.mean(metric_true)) ** 2))
+        r2 = None if denom <= 1e-12 else _float_or_none(1.0 - float(np.sum(metric_err ** 2)) / denom)
+        log_r2 = r2 if i in log_indices else None
         normalized_mae = None
         if norm_std is not None and i < len(norm_std) and norm_std[i] > 0:
-            normalized_mae = float(mae / max(float(norm_std[i]), 1e-6))
+            normalized_mae = float(np.mean(np.abs(metric_err)) / max(float(norm_std[i]), 1e-6))
             nmaes.append(normalized_mae)
         name = schema["pde_vec_names"][i]
         continuous["per_dimension"][name] = {
@@ -204,6 +291,8 @@ def compute_pde_metrics(pred: np.ndarray,
             "mae": mae,
             "rmse": rmse,
             "r2": r2,
+            "r2_space": "log" if i in log_indices else "raw",
+            "log_r2": log_r2,
             "normalized_mae": normalized_mae,
         }
         maes.append(mae)

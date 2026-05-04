@@ -211,6 +211,8 @@ Current model options:
 - `--pde-normalize` is enabled by default with `--pde-aux-loss`; it computes
   `pde_vec` mean/std from the training split only and stores those statistics
   in the checkpoint
+- `--pde-log-transport` is also enabled by default and normalizes viscosity,
+  bulk viscosity, and thermal conductivity in log-space
 - `--pde-cont-weight` and `--pde-law-weight` weight the continuous-parameter
   regression and viscosity-law classification terms inside the auxiliary loss
 - `--pos-encoding learned_absolute` is the default checkpoint-compatible
@@ -278,10 +280,14 @@ baseline training still works, while an explicitly requested auxiliary loss
 raises a clear error.
 
 Because `pde_vec` mixes values with different scales, the auxiliary loss
-normalizes continuous parameters using train-set-only mean/std by default. For
-the current 13D schema, the viscosity-law one-hot slice is treated as
-classification logits and trained with cross entropy; old 9D `pde_vec` files
-fall back to normalized MSE over all dimensions.
+normalizes continuous parameters using train-set-only mean/std by default.
+Transport coefficients are especially small and positive, so viscosity,
+bulk viscosity, and thermal conductivity are log-transformed before computing
+their normalization statistics. This avoids raw-scale domination and makes
+relative transport-coefficient errors more meaningful. For the current 13D
+schema, the viscosity-law one-hot slice is treated as classification logits and
+trained with cross entropy; old 9D `pde_vec` files fall back to normalized MSE
+over all dimensions, with the same log-space treatment for indices 1, 2, and 3.
 
 Example Report 1 training command:
 
@@ -291,7 +297,7 @@ Example Report 1 training command:
   --d-model 128 --heads 4 --layers 4 --patch 8 `
   --attention-type factorized --prediction-mode derivative --integrator euler `
   --use-derivatives --use-mask-channel --mask-loss `
-  --pde-aux-loss --pde-normalize --pde-aux-weight 0.01 `
+  --pde-aux-loss --pde-normalize --pde-log-transport --pde-aux-weight 0.01 `
   --pde-cont-weight 1.0 --pde-law-weight 1.0
 ```
 
@@ -332,6 +338,8 @@ including derivative features, prediction mode, integrator, and strides.
 If the checkpoint has a PDE auxiliary head and the grid files include
 `pde_vec`, `ml.evaluate` also writes `pde_metrics.json` with continuous
 parameter MAE/RMSE/R2 and viscosity-law accuracy/confusion-matrix metrics.
+When family labels are available in grid metadata, the PDE metrics also include
+`by_family` entries for ID/OOD breakdowns.
 
 Create Report 1 metric figures from an evaluation JSON:
 
@@ -339,6 +347,15 @@ Create Report 1 metric figures from an evaluation JSON:
 .\.venv\Scripts\python.exe -m ml.plot_report1_metrics `
   --metrics eval\fixed_id20_factorized\metrics.json `
   --out figures\report1\fixed_id20_factorized
+```
+
+Grouped ID/OOD comparison plots can be generated from separate evaluation
+outputs:
+
+```powershell
+.\.venv\Scripts\python.exe -m ml.plot_report1_metrics `
+  --metrics-list id:eval\id\metrics.json,ood_mild:eval\ood_mild\metrics.json,ood_hard:eval\ood_hard\metrics.json `
+  --out figures\report1\grouped
 ```
 
 ## CSD3 Scripts

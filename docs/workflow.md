@@ -145,7 +145,7 @@ experiment from temporal context without changing the main next-state target:
 .\.venv\Scripts\python.exe -m ml.train --grid datasets\grid_local_smoke --out checkpoints\local_pde_aux `
   --epochs 2 --batch 1 --context 4 --horizon 1 --device cpu `
   --d-model 64 --heads 4 --layers 2 --patch 8 `
-  --pde-aux-loss --pde-normalize --pde-aux-weight 0.01 `
+  --pde-aux-loss --pde-normalize --pde-log-transport --pde-aux-weight 0.01 `
   --pde-cont-weight 1.0 --pde-law-weight 1.0
 ```
 
@@ -156,9 +156,12 @@ old datasets.
 The PDE auxiliary loss is normalized by default because `pde_vec` mixes
 dimensionless values, tiny transport coefficients, temperature-scale values,
 one-hot viscosity-law entries, and `power_law_n`. Training-set-only mean/std are
-saved in the checkpoint. With the new 13D schema, continuous dimensions use
+saved in the checkpoint. Viscosity, bulk viscosity, and thermal conductivity are
+positive transport coefficients, so they are log-transformed before computing
+normalization statistics. With the new 13D schema, continuous dimensions use
 normalized MSE while the viscosity-law slice uses cross entropy; old 9D
-`pde_vec` files use normalized MSE over all dimensions.
+`pde_vec` files use normalized MSE over all dimensions, with indices 1, 2, and 3
+log-normalized by default.
 
 The default attention path is the original flattened global Transformer:
 `--attention-type global`, so old commands and checkpoints remain compatible.
@@ -251,7 +254,9 @@ If the checkpoint includes a PDE auxiliary head and the grid files include
 
 The PDE metrics include continuous-parameter MAE/RMSE/R2 and, when the 13D
 schema is present, viscosity-law accuracy, per-class accuracy, and a confusion
-matrix.
+matrix. If grid metadata contains family labels such as `id`, `ood_mild`, or
+`ood_hard`, `pde_metrics.json` also includes a `by_family` section for Report 1
+tables.
 
 ## F. Plot Predictions
 
@@ -277,6 +282,17 @@ For Report 1 metric figures from `metrics.json` or `pde_metrics.json`:
 This produces available plots such as `pde_r2_bar.png`, `pde_mae_bar.png`,
 `viscosity_law_confusion.png`, and `rollout_error.png`. Missing metric sections
 are skipped gracefully.
+
+Grouped ID/OOD plots from separate evaluation outputs:
+
+```powershell
+.\.venv\Scripts\python.exe -m ml.plot_report1_metrics `
+  --metrics-list id:eval\id\metrics.json,ood_mild:eval\ood_mild\metrics.json,ood_hard:eval\ood_hard\metrics.json `
+  --out figures\report1\grouped
+```
+
+When a single `pde_metrics.json` contains `by_family`, the same plotting script
+also creates grouped law-accuracy and mean-R2 plots from that file.
 
 ## Local Windows Smoke Test
 

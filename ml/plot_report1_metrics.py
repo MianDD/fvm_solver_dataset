@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List, Tuple
 
 import numpy as np
 
@@ -138,22 +138,148 @@ def _plot_rollout(metrics: Dict, out_dir: Path) -> None:
     plt.close(fig)
 
 
+def _parse_metrics_list(value: str) -> List[Tuple[str, Path]]:
+    entries: List[Tuple[str, Path]] = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" not in part:
+            raise ValueError(f"metrics-list entry must be label:path, got {part!r}")
+        label, path = part.split(":", 1)
+        entries.append((label.strip(), Path(path.strip())))
+    if not entries:
+        raise ValueError("--metrics-list did not contain any label:path entries")
+    return entries
+
+
+def _mean_rollout_mse(metrics: Dict) -> float | None:
+    rollout = metrics.get("rollout", {})
+    values = [
+        float(payload["mse"])
+        for payload in rollout.values()
+        if isinstance(payload, dict) and "mse" in payload
+    ]
+    if not values:
+        return None
+    return float(np.mean(values))
+
+
+def _grouped_records_from_metrics_list(value: str) -> List[Dict]:
+    records = []
+    for label, path in _parse_metrics_list(value):
+        metrics = _load_metrics(path)
+        pde = _pde_section(metrics)
+        records.append({
+            "label": label,
+            "metrics": metrics,
+            "pde": pde,
+            "mean_r2": None if pde is None else pde.get("overall", {}).get("mean_continuous_r2"),
+            "law_accuracy": None if pde is None else pde.get("overall", {}).get("law_accuracy"),
+            "rollout_mse": _mean_rollout_mse(metrics),
+        })
+    return records
+
+
+def _grouped_records_from_by_family(pde: Dict) -> List[Dict]:
+    records = []
+    for label, fam_pde in sorted(pde.get("by_family", {}).items()):
+        records.append({
+            "label": label,
+            "metrics": {},
+            "pde": fam_pde,
+            "mean_r2": fam_pde.get("overall", {}).get("mean_continuous_r2"),
+            "law_accuracy": fam_pde.get("overall", {}).get("law_accuracy"),
+            "rollout_mse": None,
+        })
+    return records
+
+
+def _plot_grouped_bar(records: List[Dict], key: str, filename: str,
+                      ylabel: str, title: str, out_dir: Path) -> None:
+    pairs = [
+        (rec["label"], rec.get(key))
+        for rec in records
+        if rec.get(key) is not None
+    ]
+    if not pairs:
+        print(f"Skipping {filename}: no values available.")
+        return
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:  # pragma: no cover
+        print(f"Skipping {filename}: matplotlib unavailable ({exc})")
+        return
+    labels = [label for label, _ in pairs]
+    values = [float(value) for _, value in pairs]
+    fig, ax = plt.subplots(figsize=(max(5.0, 1.2 * len(labels)), 3.4))
+    ax.bar(labels, values)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.tick_params(axis="x", rotation=25)
+    fig.tight_layout()
+    fig.savefig(out_dir / filename, dpi=180)
+    plt.close(fig)
+
+
+def _plot_grouped(records: List[Dict], out_dir: Path) -> None:
+    if not records:
+        return
+    _plot_grouped_bar(
+        records,
+        "law_accuracy",
+        "pde_law_accuracy_by_family.png",
+        "accuracy",
+        "Viscosity-law accuracy by family",
+        out_dir,
+    )
+    _plot_grouped_bar(
+        records,
+        "mean_r2",
+        "pde_mean_r2_by_family.png",
+        "mean R^2",
+        "Mean PDE continuous R^2 by family",
+        out_dir,
+    )
+    _plot_grouped_bar(
+        records,
+        "rollout_mse",
+        "rollout_mse_by_family.png",
+        "mean rollout MSE",
+        "Rollout MSE by family",
+        out_dir,
+    )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--metrics", required=True, help="metrics.json or pde_metrics.json from ml.evaluate")
+    ap.add_argument("--metrics", help="metrics.json or pde_metrics.json from ml.evaluate")
+    ap.add_argument(
+        "--metrics-list",
+        default=None,
+        help="comma-separated label:path entries, e.g. id:eval/id/metrics.json,ood_mild:eval/ood/metrics.json",
+    )
     ap.add_argument("--out", required=True, help="output directory for PNG figures")
     args = ap.parse_args()
 
-    metrics = _load_metrics(args.metrics)
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-    pde = _pde_section(metrics)
-    if pde is None:
-        print("No PDE identification metrics found; PDE plots skipped.")
-    else:
-        _plot_continuous_bars(pde, out_dir)
-        _plot_confusion(pde, out_dir)
-    _plot_rollout(metrics, out_dir)
+    if args.metrics_list:
+        _plot_grouped(_grouped_records_from_metrics_list(args.metrics_list), out_dir)
+    if args.metrics:
+        metrics = _load_metrics(args.metrics)
+        pde = _pde_section(metrics)
+        if pde is None:
+            print("No PDE identification metrics found; PDE plots skipped.")
+        else:
+            _plot_continuous_bars(pde, out_dir)
+            _plot_confusion(pde, out_dir)
+            _plot_grouped(_grouped_records_from_by_family(pde), out_dir)
+        _plot_rollout(metrics, out_dir)
+    if not args.metrics and not args.metrics_list:
+        raise SystemExit("ERROR: provide --metrics, --metrics-list, or both")
     print(f"Wrote Report 1 figures to {out_dir}")
 
 

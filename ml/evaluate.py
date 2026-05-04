@@ -207,6 +207,7 @@ def evaluate(grid_dir: str | Path, ckpt_path: str | Path, out_dir: str | Path,
     can_eval_pde = bool(getattr(model, "pde_head", None) is not None and ds.has_pde_vec)
     pde_pred_chunks: List[torch.Tensor] = []
     pde_true_chunks: List[torch.Tensor] = []
+    pde_family_labels: List[str] = []
     pde_skip_reason = None
     if getattr(model, "pde_head", None) is None:
         pde_skip_reason = "checkpoint has no PDE auxiliary head"
@@ -220,6 +221,7 @@ def evaluate(grid_dir: str | Path, ckpt_path: str | Path, out_dir: str | Path,
             if can_eval_pde and pred_pde is not None:
                 pde_pred_chunks.append(pred_pde.detach().cpu())
                 pde_true_chunks.append(batch["pde_vec"].detach().cpu())
+                pde_family_labels.extend(str(family) for family in batch["family"])
             strides_b = batch["stride"].detach().cpu().tolist()
             families = batch["family"]
             for i, stride_i in enumerate(strides_b):
@@ -273,12 +275,32 @@ def evaluate(grid_dir: str | Path, ckpt_path: str | Path, out_dir: str | Path,
         ckpt_schema = ckpt.get("pde_schema") or model_cfg.get("pde_schema") or {}
         schema = ckpt_schema if ckpt_schema else ds.pde_schema
         pde_normalizer = ckpt.get("pde_normalizer") or model_cfg.get("pde_normalizer")
+        pde_pred_all = torch.cat(pde_pred_chunks, dim=0).numpy()
+        pde_true_all = torch.cat(pde_true_chunks, dim=0).numpy()
         pde_metrics = compute_pde_metrics(
-            torch.cat(pde_pred_chunks, dim=0).numpy(),
-            torch.cat(pde_true_chunks, dim=0).numpy(),
+            pde_pred_all,
+            pde_true_all,
             schema=schema,
             normalizer=pde_normalizer,
         )
+        usable_family_labels = [
+            label for label in pde_family_labels
+            if label and label.lower() not in {"unknown", "none", "null"}
+        ]
+        if len(pde_family_labels) == len(pde_pred_all) and usable_family_labels:
+            by_pde_family = {}
+            labels_arr = np.asarray(pde_family_labels, dtype=object)
+            for family in sorted(set(usable_family_labels)):
+                mask = labels_arr == family
+                if np.any(mask):
+                    by_pde_family[family] = compute_pde_metrics(
+                        pde_pred_all[mask],
+                        pde_true_all[mask],
+                        schema=schema,
+                        normalizer=pde_normalizer,
+                    )
+            if by_pde_family:
+                pde_metrics["by_family"] = by_pde_family
         pde_metrics["normalizer_available"] = pde_normalizer is not None
         metrics["pde_identification"] = pde_metrics
         (out_dir / "pde_metrics.json").write_text(json.dumps(pde_metrics, indent=2), encoding="utf-8")

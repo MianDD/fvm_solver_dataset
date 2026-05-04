@@ -59,6 +59,8 @@ class TrainConfig:
     pde_aux_loss: bool = False
     pde_aux_weight: float = 0.01
     pde_normalize: bool = True
+    pde_log_transport: bool = True
+    pde_log_eps: float = 1e-12
     pde_cont_weight: float = 1.0
     pde_law_weight: float = 1.0
     pde_dim: int = 0
@@ -183,6 +185,8 @@ def model_config_dict(cfg: TrainConfig, C_in: int, H: int, W: int) -> Dict:
         "pde_aux_loss": cfg.pde_aux_loss,
         "pde_aux_weight": cfg.pde_aux_weight,
         "pde_normalize": cfg.pde_normalize if cfg.pde_aux_loss else False,
+        "pde_log_transport": cfg.pde_log_transport if cfg.pde_aux_loss else False,
+        "pde_log_eps": cfg.pde_log_eps,
         "pde_cont_weight": cfg.pde_cont_weight,
         "pde_law_weight": cfg.pde_law_weight,
         "pde_dim": cfg.pde_dim if cfg.pde_aux_loss else 0,
@@ -298,6 +302,8 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         raise ValueError("--pde-cont-weight must be non-negative.")
     if cfg.pde_law_weight < 0.0:
         raise ValueError("--pde-law-weight must be non-negative.")
+    if cfg.pde_log_eps <= 0.0:
+        raise ValueError("--pde-log-eps must be positive.")
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     out_dir = Path(cfg.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -358,7 +364,13 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
                 print("Loaded PDE auxiliary normalizer from resume checkpoint.")
             else:
                 pde_vectors = pde_vectors_from_records(train_ds._cache)
-                pde_normalizer = compute_pde_normalizer(pde_vectors, min_std=1e-6)
+                pde_normalizer = compute_pde_normalizer(
+                    pde_vectors,
+                    min_std=1e-6,
+                    log_transport=cfg.pde_log_transport,
+                    log_eps=cfg.pde_log_eps,
+                    names=pde_schema.get("pde_vec_names"),
+                )
         save_json(out_dir / "train_config.json", dc.asdict(cfg))
     physical_spacing_used = bool(
         cfg.use_derivatives and train_ds.uses_physical_spacing and val_ds.uses_physical_spacing
@@ -401,6 +413,10 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         )
         print(f"  pde_mean: {np.array(pde_normalizer['mean']).round(6).tolist() if pde_normalizer else 'not used'}")
         print(f"  pde_std : {np.array(pde_normalizer['std']).round(6).tolist() if pde_normalizer else 'not used'}")
+        if pde_normalizer:
+            log_indices = [int(i) for i in pde_normalizer.get("log_indices", [])]
+            log_names = [pde_schema.get("pde_vec_names", [])[i] for i in log_indices]
+            print(f"  pde_log_indices: {log_indices}  names={log_names}  eps={pde_normalizer.get('log_eps')}")
     print(f"Input noise std: {cfg.input_noise_std:g} normalizer-std units (training only)")
     attention_complexity = attention_complexity_dict(cfg, H, W)
     print_attention_complexity(attention_complexity)
@@ -409,7 +425,8 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
     if cfg.pde_aux_loss and pde_normalizer is not None and model.pde_head is not None and not cfg.resume:
         with torch.no_grad():
             model.pde_head[-1].weight.zero_()
-            bias = torch.as_tensor(pde_normalizer["mean"], dtype=torch.float32, device=device)
+            bias_values = pde_normalizer.get("raw_mean", pde_normalizer["mean"])
+            bias = torch.as_tensor(bias_values, dtype=torch.float32, device=device)
             model.pde_head[-1].bias.copy_(bias)
     model_cfg = model_config_dict(cfg, C_in, H, W)
     model_cfg["physical_derivative_spacing"] = "physical" if physical_spacing_used else "index_or_unused"
@@ -422,6 +439,8 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
             "enabled": bool(cfg.pde_normalize),
             "pde_schema": pde_schema,
             "pde_normalizer": pde_normalizer,
+            "pde_log_transport": cfg.pde_log_transport,
+            "pde_log_eps": cfg.pde_log_eps,
             "pde_cont_weight": cfg.pde_cont_weight,
             "pde_law_weight": cfg.pde_law_weight,
         })
@@ -665,6 +684,8 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         "pde_aux_loss": cfg.pde_aux_loss,
         "pde_aux_weight": cfg.pde_aux_weight,
         "pde_normalize": cfg.pde_normalize if cfg.pde_aux_loss else False,
+        "pde_log_transport": cfg.pde_log_transport if cfg.pde_aux_loss else False,
+        "pde_log_eps": cfg.pde_log_eps,
         "pde_cont_weight": cfg.pde_cont_weight,
         "pde_law_weight": cfg.pde_law_weight,
         "pde_dim": cfg.pde_dim if cfg.pde_aux_loss else 0,
@@ -725,6 +746,13 @@ def main() -> None:
     ap.add_argument("--no-pde-normalize", dest="pde_normalize", action="store_false",
                     help="disable pde_vec normalization for the auxiliary loss")
     ap.set_defaults(pde_normalize=True)
+    ap.add_argument("--pde-log-transport", dest="pde_log_transport", action="store_true",
+                    help="log-transform viscosity, bulk viscosity, and thermal conductivity before PDE normalization")
+    ap.add_argument("--no-pde-log-transport", dest="pde_log_transport", action="store_false",
+                    help="disable log-space normalization for transport coefficients")
+    ap.set_defaults(pde_log_transport=True)
+    ap.add_argument("--pde-log-eps", type=float, default=1e-12,
+                    help="positive floor before log-transforming PDE transport coefficients")
     ap.add_argument("--pde-cont-weight", type=float, default=1.0,
                     help="weight for continuous PDE regression inside the auxiliary loss")
     ap.add_argument("--pde-law-weight", type=float, default=1.0,
@@ -749,6 +777,8 @@ def main() -> None:
         ap.error("--pde-cont-weight must be non-negative.")
     if args.pde_law_weight < 0.0:
         ap.error("--pde-law-weight must be non-negative.")
+    if args.pde_log_eps <= 0.0:
+        ap.error("--pde-log-eps must be positive.")
 
     cfg = TrainConfig(
         grid_dir=args.grid,
@@ -779,6 +809,8 @@ def main() -> None:
         pde_aux_loss=args.pde_aux_loss,
         pde_aux_weight=args.pde_aux_weight,
         pde_normalize=args.pde_normalize,
+        pde_log_transport=args.pde_log_transport,
+        pde_log_eps=args.pde_log_eps,
         pde_cont_weight=args.pde_cont_weight,
         pde_law_weight=args.pde_law_weight,
         pde_dim=args.pde_dim,
