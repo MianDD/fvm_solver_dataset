@@ -1,27 +1,5 @@
 """Patch-transformer foundation model for varying-PDE 2D fluid prediction.
 
-Design notes (and how this differs from FLUID-LLM and the supervisor's brief):
-
-    * **FLUID-LLM** (Zhu, Bazaga, Lio 2024 — your supervisor's own paper)
-      trains a pretrained large language model on a *single fixed* fluid
-      problem. The model adapts to one task; in-context learning is
-      observed only as a small (~3%) effect.
-
-    * **This project** trains across a *family* of PDEs and asks the model
-      to *infer* which member of the family generated the context
-      observations. This is the foundation-model formulation studied in
-      Poseidon (Herde et al. 2024), Walrus (McCabe et al. 2025), and TNT
-      (Dang et al. 2022), and is analogous to TabPFN's transformer prior
-      over tabular tasks (Hollmann et al. 2023).
-
-    * For computational tractability on a coursework budget, we drop the
-      pretrained LLM weights — a from-scratch Transformer encoder is
-      sufficient to demonstrate the architectural ideas (patch encoding,
-      spatiotemporal embedding, autoregressive next-state prediction).
-      Pretrained-LLM initialisation can be added later by replacing the
-      transformer block with e.g. an OPT-125m backbone; only this file
-      would need to change.
-
 Architecture
 ------------
     state s_t in R^(C x H x W)               # C=4: V_x, V_y, rho, T

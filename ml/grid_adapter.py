@@ -1,21 +1,4 @@
 """Adapter: unstructured FVM snapshots --> regular-grid arrays.
-
-The supervisor's solver produces snapshots on a triangular mesh whose
-node count varies between simulations (because each run's mesh is
-re-generated with different random ellipses). Foundation-model
-architectures based on patch-encoders (ViT / FLUID-LLM / Walrus) need
-**fixed-shape** inputs, so we resample the cell-centred primitives
-(``[V_x, V_y, rho, T]``) onto a regular Cartesian grid by linear
-interpolation, falling back to nearest-neighbour outside the convex hull.
-
-This module also deals with the supervisor's storage convention:
-snapshots are saved in fp16 and z-score-normalised per-snapshot, so we
-de-normalise here before interpolating.
-
-Output of :func:`assemble_dataset` for a sweep folder is a single
-``.npz`` per sim with the interpolated tensor of shape
-``(T, 4, H, W)``, time stamps, channel names, metadata, and a ``pde_vec``
-fingerprint for diagnostics.
 """
 
 from __future__ import annotations
