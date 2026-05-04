@@ -45,6 +45,7 @@ class TrainConfig:
     n_layers: int = 4
     dropout: float = 0.0
     mlp_ratio: float = 4.0
+    attention_type: str = "global"
     num_workers: int = 0
     save_every: int = 0
     resume: str | None = None
@@ -113,6 +114,7 @@ def make_model(cfg: TrainConfig, C_in: int, H: int, W: int) -> FoundationCFDMode
         max_context=cfg.context_length,
         dropout=cfg.dropout,
         mlp_ratio=cfg.mlp_ratio,
+        attention_type=cfg.attention_type,
     )
 
 
@@ -131,6 +133,7 @@ def model_config_dict(cfg: TrainConfig, C_in: int, H: int, W: int) -> Dict:
         "max_context": cfg.context_length,
         "dropout": cfg.dropout,
         "mlp_ratio": cfg.mlp_ratio,
+        "attention_type": cfg.attention_type,
         "input_channel_names": _input_channel_names(cfg.use_derivatives),
         "target_channel_names": TARGET_CHANNEL_NAMES,
         "use_derivatives": cfg.use_derivatives,
@@ -140,6 +143,44 @@ def model_config_dict(cfg: TrainConfig, C_in: int, H: int, W: int) -> Dict:
         "integrator": cfg.integrator,
         "strides": parse_strides(cfg.strides),
     }
+
+
+def attention_complexity_dict(cfg: TrainConfig, H: int, W: int) -> Dict:
+    if H % cfg.patch_size != 0 or W % cfg.patch_size != 0:
+        raise ValueError(
+            f"H={H}, W={W} must be divisible by patch size {cfg.patch_size} "
+            "before attention complexity can be computed."
+        )
+    T = int(cfg.context_length)
+    n_patches = (H // cfg.patch_size) * (W // cfg.patch_size)
+    total_tokens = T * n_patches
+    global_pairs = total_tokens ** 2
+    factorized_pairs = T * (n_patches ** 2) + n_patches * (T ** 2)
+    reduction = float(global_pairs / factorized_pairs) if factorized_pairs else float("inf")
+    return {
+        "attention_type": cfg.attention_type,
+        "context_length": T,
+        "patches_per_frame": n_patches,
+        "total_tokens": total_tokens,
+        "global_pair_count": global_pairs,
+        "factorized_pair_count": factorized_pairs,
+        "factorized_reduction_vs_global": reduction,
+    }
+
+
+def print_attention_complexity(complexity: Dict) -> None:
+    print(
+        "Attention complexity: "
+        f"T={complexity['context_length']} "
+        f"N={complexity['patches_per_frame']} "
+        f"tokens={complexity['total_tokens']}"
+    )
+    print(
+        "  pair counts: "
+        f"global={(complexity['global_pair_count']):,} "
+        f"factorized={(complexity['factorized_pair_count']):,} "
+        f"reduction={complexity['factorized_reduction_vs_global']:.2f}x"
+    )
 
 
 def save_json(path: Path, payload: Dict) -> None:
@@ -241,11 +282,17 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
     sample = train_ds[0]
     _, C_in, H, W = sample["input_states"].shape
     print(f"Input shape: C_in={C_in} H={H} W={W}")
-    print(f"Prediction mode: {cfg.prediction_mode}  integrator: {cfg.integrator}  strides={cfg.strides}")
+    print(
+        f"Prediction mode: {cfg.prediction_mode}  integrator: {cfg.integrator}  "
+        f"strides={cfg.strides}  attention={cfg.attention_type}"
+    )
+    attention_complexity = attention_complexity_dict(cfg, H, W)
+    print_attention_complexity(attention_complexity)
 
     model = make_model(cfg, C_in, H, W).to(device)
     model_cfg = model_config_dict(cfg, C_in, H, W)
     model_cfg["physical_derivative_spacing"] = "physical" if physical_spacing_used else "index_or_unused"
+    model_cfg["attention_complexity"] = attention_complexity
     save_json(out_dir / "model_config.json", model_cfg)
     print(f"Model params: {count_params(model):,}")
 
@@ -360,6 +407,8 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         "use_derivatives": cfg.use_derivatives,
         "use_physical_derivatives": cfg.use_physical_derivatives,
         "physical_derivative_spacing": model_cfg["physical_derivative_spacing"],
+        "attention_type": cfg.attention_type,
+        "attention_complexity": attention_complexity,
         "strides": parse_strides(cfg.strides),
     }
     save_json(out_dir / "metrics.json", metrics)
@@ -398,6 +447,7 @@ def main() -> None:
     ap.add_argument("--patch-t", type=int, default=1)
     ap.add_argument("--dropout", type=float, default=0.0)
     ap.add_argument("--mlp-ratio", type=float, default=4.0)
+    ap.add_argument("--attention-type", choices=["global", "factorized"], default="global")
     ap.add_argument("--use-derivatives", dest="use_derivatives", action="store_true")
     ap.add_argument("--no-derivatives", dest="use_derivatives", action="store_false")
     ap.set_defaults(use_derivatives=False)
@@ -430,6 +480,7 @@ def main() -> None:
         patch_t=args.patch_t,
         dropout=args.dropout,
         mlp_ratio=args.mlp_ratio,
+        attention_type=args.attention_type,
         use_derivatives=args.use_derivatives,
         derivative_mode=args.derivative_mode,
         use_physical_derivatives=True,

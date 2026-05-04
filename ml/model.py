@@ -34,6 +34,9 @@ Architecture
     -> Transformer encoder with **block-causal** attention mask
        (future-step tokens are masked out so the model is autoregressive
         in time, all-to-all in space within each step)
+       Optional experimental factorized attention keeps tokens as (B,T,N,D)
+       and alternates spatial attention over N with causal temporal attention
+       over T.
     -> patch decoder (linear -> linear -> P x P x C)
     -> reassemble into a delta-state
     -> next state = current state + delta
@@ -41,11 +44,12 @@ Architecture
 
 from __future__ import annotations
 
-from typing import Tuple
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+ATTENTION_TYPES = ("global", "factorized")
 
 
 # --------------------------------------------------------------------------
@@ -55,8 +59,11 @@ def to_patches(x: torch.Tensor, patch_size: int) -> torch.Tensor:
     """x: (B, C, H, W) -> (B, N, C * P * P) with N = (H/P)(W/P)."""
     B, C, H, W = x.shape
     P = patch_size
-    assert H % P == 0 and W % P == 0, \
-        f"H,W must be divisible by P (got H={H}, W={W}, P={P})"
+    if H % P != 0 or W % P != 0:
+        raise ValueError(
+            f"H and W must be divisible by patch_size before patchifying "
+            f"(got H={H}, W={W}, patch_size={P})."
+        )
     x = x.reshape(B, C, H // P, P, W // P, P)
     x = x.permute(0, 2, 4, 1, 3, 5).contiguous()
     x = x.reshape(B, (H // P) * (W // P), C * P * P)
@@ -68,7 +75,8 @@ def from_patches(tokens: torch.Tensor, C: int, H: int, W: int, P: int
     """tokens: (B, N, C * P * P) -> (B, C, H, W)."""
     B, N, _ = tokens.shape
     Hp, Wp = H // P, W // P
-    assert N == Hp * Wp
+    if N != Hp * Wp:
+        raise ValueError(f"Expected {Hp * Wp} patches for H={H}, W={W}, P={P}; got {N}.")
     x = tokens.reshape(B, Hp, Wp, C, P, P)
     x = x.permute(0, 3, 1, 4, 2, 5).contiguous()
     x = x.reshape(B, C, H, W)
@@ -93,7 +101,8 @@ class SpatiotemporalEmbedding(nn.Module):
 
     def forward(self, tokens: torch.Tensor, n_x: int, n_y: int) -> torch.Tensor:
         B, tau, N, d = tokens.shape
-        assert N == n_x * n_y, f"N={N} != n_x*n_y={n_x*n_y}"
+        if N != n_x * n_y:
+            raise ValueError(f"N={N} != n_x*n_y={n_x*n_y}")
         device = tokens.device
         xs = torch.arange(n_x, device=device).repeat_interleave(n_y)
         ys = torch.arange(n_y, device=device).repeat(n_x)
@@ -107,6 +116,92 @@ class SpatiotemporalEmbedding(nn.Module):
         temporal = F.pad(et, (self.dx + self.dy, 0))           # (tau, d)
         temporal = temporal.unsqueeze(0).unsqueeze(2)          # (1,tau,1,d)
         return tokens + spatial + temporal
+
+
+# --------------------------------------------------------------------------
+# Factorized space-time attention
+# --------------------------------------------------------------------------
+class FactorizedSpaceTimeBlock(nn.Module):
+    """TimeSformer/ViViT-style block over structured (B, T, N, D) tokens."""
+
+    def __init__(self, d_model: int, n_heads: int, mlp_ratio: float = 4.0,
+                 dropout: float = 0.0):
+        super().__init__()
+        self.spatial_norm = nn.LayerNorm(d_model)
+        self.spatial_attn = nn.MultiheadAttention(
+            d_model, n_heads, dropout=dropout, batch_first=True,
+        )
+        self.temporal_norm = nn.LayerNorm(d_model)
+        self.temporal_attn = nn.MultiheadAttention(
+            d_model, n_heads, dropout=dropout, batch_first=True,
+        )
+        self.mlp_norm = nn.LayerNorm(d_model)
+        hidden = int(mlp_ratio * d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, d_model),
+            nn.Dropout(dropout),
+        )
+        self.dropout = nn.Dropout(dropout)
+        self._temporal_mask_cache: dict[tuple[int, str, int | None], torch.Tensor] = {}
+
+    def _temporal_causal_mask(self, T: int, device: torch.device) -> torch.Tensor:
+        """Bool mask for causal temporal attention; True entries are masked."""
+        key = (T, device.type, device.index)
+        mask = self._temporal_mask_cache.get(key)
+        if mask is None or mask.device != device:
+            mask = torch.triu(
+                torch.ones(T, T, dtype=torch.bool, device=device),
+                diagonal=1,
+            )
+            self._temporal_mask_cache[key] = mask
+        return mask
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        B, T, N, D = tokens.shape
+
+        # Spatial attention: each time step attends across its N spatial patches.
+        # (B, T, N, D) -> (B*T, N, D)
+        spatial_in = self.spatial_norm(tokens).reshape(B * T, N, D)
+        spatial_out, _ = self.spatial_attn(
+            spatial_in, spatial_in, spatial_in, need_weights=False,
+        )
+        tokens = tokens + self.dropout(spatial_out.reshape(B, T, N, D))
+
+        # Temporal attention: each patch index attends backward over T context frames.
+        # (B, T, N, D) -> (B, N, T, D) -> (B*N, T, D)
+        temporal_in = self.temporal_norm(tokens).permute(0, 2, 1, 3).reshape(B * N, T, D)
+        temporal_out, _ = self.temporal_attn(
+            temporal_in, temporal_in, temporal_in,
+            attn_mask=self._temporal_causal_mask(T, tokens.device),
+            need_weights=False,
+        )
+        # Restore the structured token layout for the next factorized block.
+        # (B*N, T, D) -> (B, N, T, D) -> (B, T, N, D)
+        temporal_out = temporal_out.reshape(B, N, T, D).permute(0, 2, 1, 3)
+        tokens = tokens + self.dropout(temporal_out)
+
+        tokens = tokens + self.mlp(self.mlp_norm(tokens))
+        return tokens
+
+
+class FactorizedSpaceTimeEncoder(nn.Module):
+    """Stack of factorized space-time attention blocks."""
+
+    def __init__(self, d_model: int, n_heads: int, n_layers: int,
+                 mlp_ratio: float = 4.0, dropout: float = 0.0):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            FactorizedSpaceTimeBlock(d_model, n_heads, mlp_ratio, dropout)
+            for _ in range(n_layers)
+        ])
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        for layer in self.layers:
+            tokens = layer(tokens)
+        return tokens
 
 
 # --------------------------------------------------------------------------
@@ -168,10 +263,22 @@ class FoundationCFDModel(nn.Module):
                  n_target_channels: int | None = None,
                  patch_size: int = 8, d_model: int = 128, n_heads: int = 4,
                  n_layers: int = 4, max_context: int = 8, dropout: float = 0.0,
-                 mlp_ratio: float = 4.0):
+                 mlp_ratio: float = 4.0, attention_type: str = "global"):
         super().__init__()
-        assert H % patch_size == 0 and W % patch_size == 0, \
-            f"H={H}, W={W} must be divisible by patch_size={patch_size}"
+        if attention_type not in ATTENTION_TYPES:
+            allowed = ", ".join(repr(name) for name in ATTENTION_TYPES)
+            raise ValueError(f"attention_type must be one of {allowed}; got {attention_type!r}.")
+        if patch_size <= 0:
+            raise ValueError(f"patch_size must be positive; got {patch_size}.")
+        if H % patch_size != 0 or W % patch_size != 0:
+            raise ValueError(
+                f"H and W must be divisible by patch_size before patchifying "
+                f"(got H={H}, W={W}, patch_size={patch_size})."
+            )
+        if n_heads <= 0:
+            raise ValueError(f"n_heads must be positive; got {n_heads}.")
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model={d_model} must be divisible by n_heads={n_heads}.")
         self.C_in = int(n_input_channels or n_channels)
         self.C = int(n_target_channels or n_channels)
         self.H = H; self.W = W; self.P = patch_size
@@ -181,6 +288,7 @@ class FoundationCFDModel(nn.Module):
         self.d_model = d_model
         self.max_context = max_context
         self.mlp_ratio = mlp_ratio
+        self.attention_type = attention_type
 
         self.normaliser = ChannelNormaliser(self.C_in)
 
@@ -194,12 +302,18 @@ class FoundationCFDModel(nn.Module):
             max_x=self.n_x, max_y=self.n_y,
             max_t=max_context, d_model=d_model,
         )
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=n_heads,
-            dim_feedforward=int(mlp_ratio * d_model), dropout=dropout,
-            batch_first=True, activation="gelu", norm_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        if attention_type == "global":
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=d_model, nhead=n_heads,
+                dim_feedforward=int(mlp_ratio * d_model), dropout=dropout,
+                batch_first=True, activation="gelu", norm_first=True,
+            )
+            self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        else:
+            self.factorized_encoder = FactorizedSpaceTimeEncoder(
+                d_model=d_model, n_heads=n_heads, n_layers=n_layers,
+                mlp_ratio=mlp_ratio, dropout=dropout,
+            )
         self.patch_decoder = nn.Sequential(
             nn.Linear(d_model, d_model), nn.GELU(),
             nn.Linear(d_model, patch_dim_out),
@@ -211,14 +325,24 @@ class FoundationCFDModel(nn.Module):
             nn.Conv2d(32, self.C, 3, padding=1),
         )
 
-    def encode_context(self, states: torch.Tensor) -> torch.Tensor:
+    def encode_context_tokens(self, states: torch.Tensor) -> torch.Tensor:
         B, tau, C, H, W = states.shape
-        assert C == self.C_in, f"Expected {self.C_in} input channels, got {C}"
+        if C != self.C_in:
+            raise ValueError(f"Expected {self.C_in} input channels, got {C}.")
+        if (H, W) != (self.H, self.W):
+            raise ValueError(f"Expected grid shape H={self.H}, W={self.W}; got H={H}, W={W}.")
+        if tau > self.max_context:
+            raise ValueError(f"Context length {tau} exceeds max_context={self.max_context}.")
         x = states.reshape(B * tau, C, H, W)
         tokens = to_patches(x, self.P)                  # (B*tau, N, C*P*P)
         tokens = self.patch_encoder(tokens)              # (B*tau, N, d)
-        tokens = tokens.reshape(B, tau, self.N, self.d_model)
+        tokens = tokens.reshape(B, tau, self.N, self.d_model)  # (B, T, N, D)
         tokens = self.spatiotemporal(tokens, self.n_x, self.n_y)
+        return tokens
+
+    def encode_context(self, states: torch.Tensor) -> torch.Tensor:
+        B, tau, _, _, _ = states.shape
+        tokens = self.encode_context_tokens(states)
         return tokens.reshape(B, tau * self.N, self.d_model)
 
     def _block_causal_mask(self, tau: int, device) -> torch.Tensor:
@@ -232,25 +356,49 @@ class FoundationCFDModel(nn.Module):
         """Return model-predicted delta or dX/dt fields.
 
         The interpretation is chosen by the caller via ``prediction_mode``.
-        Shape: ``(B, tau, n_target_channels, H, W)``.
+        Global attention preserves the legacy return shape
+        ``(B, T, n_target_channels, H, W)`` by decoding every context step.
+        Factorized attention decodes only the final context step and returns
+        ``(B, 1, n_target_channels, H, W)``. Training/evaluation callers use
+        ``[:, -1]`` in both cases, so the one-step prediction target is the
+        same semantic object: final context-step spatial tokens.
         """
+        if states.dim() != 5:
+            raise ValueError(f"Expected states with shape (B, T, C, H, W); got {tuple(states.shape)}.")
+        B, tau, C, H, W = states.shape
+        if C != self.C_in:
+            raise ValueError(f"Expected {self.C_in} input channels, got {C}.")
+        if (H, W) != (self.H, self.W):
+            raise ValueError(f"Expected grid shape H={self.H}, W={self.W}; got H={H}, W={W}.")
+        if tau > self.max_context:
+            raise ValueError(f"Context length {tau} exceeds max_context={self.max_context}.")
         if not normalised:
             x = self.normaliser.normalise(states.reshape(-1, self.C_in, self.H, self.W))
             states_n = x.reshape(*states.shape)
         else:
             states_n = states
-        B, tau, C, H, W = states_n.shape
 
-        tokens = self.encode_context(states_n)
-        mask = self._block_causal_mask(tau, tokens.device)
-        out = self.transformer(tokens, mask=mask)
-        out = out.reshape(B, tau, self.N, self.d_model)
-
-        flat = out.reshape(B * tau, self.N, self.d_model)
+        tokens_structured = self.encode_context_tokens(states_n)  # (B, T, N, D)
+        if self.attention_type == "global":
+            # Legacy baseline path: flatten time and space into one block-causal
+            # sequence, then decode all T context steps for checkpoint/repro
+            # compatibility. Downstream code selects the final slice with [:, -1].
+            tokens = tokens_structured.reshape(B, tau * self.N, self.d_model)
+            mask = self._block_causal_mask(tau, tokens.device)
+            out = self.transformer(tokens, mask=mask)
+            out = out.reshape(B, tau, self.N, self.d_model)
+            flat = out.reshape(B * tau, self.N, self.d_model)
+            out_tau = tau
+        else:
+            # Experimental path: keep tokens structured as (B, T, N, D), use
+            # factorized spatial/temporal attention, and decode final-step tokens.
+            out = self.factorized_encoder(tokens_structured)
+            flat = out[:, -1].reshape(B, self.N, self.d_model)
+            out_tau = 1
         patches = self.patch_decoder(flat)
         delta = from_patches(patches, self.C, H, W, self.P)
         delta = delta + self.refine(delta)
-        return delta.reshape(B, tau, self.C, H, W)
+        return delta.reshape(B, out_tau, self.C, H, W)
 
     @staticmethod
     def integrate_update(current_state: torch.Tensor, update: torch.Tensor,
@@ -285,7 +433,10 @@ class FoundationCFDModel(nn.Module):
         if current_state is None:
             if states.shape[2] < self.C:
                 raise ValueError("current_state is required when inputs do not contain target channels")
-            current_state = states[:, :, :self.C]
+            if update.shape[1] == 1:
+                current_state = states[:, -1:, :self.C]
+            else:
+                current_state = states[:, :, :self.C]
         return self.integrate_update(
             current_state,
             update,

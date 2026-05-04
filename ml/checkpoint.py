@@ -13,7 +13,7 @@ from .model import FoundationCFDModel
 MODEL_KWARGS = {
     "n_channels", "n_input_channels", "n_target_channels", "H", "W",
     "patch_size", "d_model", "n_heads", "n_layers", "max_context",
-    "dropout", "mlp_ratio",
+    "dropout", "mlp_ratio", "attention_type",
 }
 
 
@@ -34,7 +34,11 @@ def load_model_from_checkpoint(path: str | Path, device: str = "cpu") -> Tuple[F
             "max_context": cfg.get("context_length", 4) + cfg.get("prediction_horizon", 1),
             "dropout": cfg.get("dropout", 0.0),
             "mlp_ratio": cfg.get("mlp_ratio", 4.0),
+            "attention_type": cfg.get("attention_type", "global"),
         }
+    # Backward compatibility: checkpoints created before the factorized
+    # attention experiment do not store attention_type. They are global models.
+    model_cfg.setdefault("attention_type", "global")
     model_kwargs = {k: v for k, v in model_cfg.items() if k in MODEL_KWARGS}
     model = FoundationCFDModel(**model_kwargs).to(device)
     model.load_state_dict(ckpt["model"])

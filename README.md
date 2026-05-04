@@ -90,6 +90,25 @@ time-derivative update that is integrated by Forward Euler:
   --use-derivatives --derivative-mode central --strides 1,2
 ```
 
+The Transformer attention defaults to the original flattened global baseline:
+`--attention-type global`, so old commands and checkpoints remain compatible.
+For future ID20/ID200 experiments, `--attention-type factorized` is the main
+scalable architecture to try, while global is retained as the baseline/ablation.
+No accuracy claim is made until the matched ID20/ID200 comparison is complete.
+
+Global attention has pair-count complexity `O((T N)^2)` for context length `T`
+and spatial patches per frame `N`. Factorized attention uses spatial attention
+per frame plus causal temporal attention per patch, `O(T N^2 + N T^2)`. For the
+current ID200 shape `H=64`, `W=96`, `P=8`, `T=4`, there are `N=96` patches:
+global pairs `147456`, factorized pairs `38400`, about a `3.8x` reduction.
+
+```powershell
+.\.venv\Scripts\python.exe -m ml.train --grid datasets\grid_local_smoke --out checkpoints\local_factorized `
+  --epochs 2 --batch 1 --context 4 --horizon 1 --device cpu `
+  --d-model 64 --heads 4 --layers 2 --patch 8 `
+  --attention-type factorized
+```
+
 Derivative input channels are `[original, dx, dy, dt]` for each physical
 channel. Spatial derivatives use physical `dx` and `dy` saved by
 `ml.grid_adapter`; old grid files without spacing metadata fall back to index

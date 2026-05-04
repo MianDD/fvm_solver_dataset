@@ -110,6 +110,27 @@ GPhyT-inspired mode adds derivative input features and asks the model to predict
   --use-derivatives --derivative-mode central --strides 1,2
 ```
 
+The default attention path is the original flattened global Transformer:
+`--attention-type global`, so old commands and checkpoints remain compatible.
+For future ID20/ID200 experiments, `--attention-type factorized` is the main
+scalable architecture to try, while global is retained as the baseline/ablation.
+No accuracy claim is made until the matched ID20/ID200 comparison is complete.
+
+Global attention has pair-count complexity `O((T N)^2)` for context length `T`
+and patches per frame `N`. Factorized attention uses spatial attention per time
+step plus causal temporal attention per patch, `O(T N^2 + N T^2)`. For the
+current ID200 shape `H=64`, `W=96`, `P=8`, `T=4`, there are `N=96` patches:
+global pairs `147456`, factorized pairs `38400`, about a `3.8x` reduction.
+
+To use factorized attention while keeping the same dataset and training loop:
+
+```powershell
+.\.venv\Scripts\python.exe -m ml.train --grid datasets\grid_local_smoke --out checkpoints\local_factorized `
+  --epochs 2 --batch 1 --context 4 --horizon 1 --device cpu `
+  --d-model 64 --heads 4 --layers 2 --patch 8 `
+  --attention-type factorized
+```
+
 `--horizon 1` and `--patch-t 1` are currently implemented. Larger temporal
 tubelets are the next architecture step because they require changing both
 tokenisation and detokenisation; this pass keeps the stable spatial patch
@@ -221,6 +242,31 @@ sbatch scripts/csd3_train_cpu.slurm
 sbatch scripts/csd3_train_gpu.slurm
 sbatch scripts/csd3_eval.slurm
 sbatch scripts/csd3_plot.slurm
+```
+
+For a controlled ID20 attention comparison after generating/converting
+`datasets/grid_fixed_id20_csd3`, run:
+
+```bash
+sbatch scripts/csd3_train_id20_global_cmp.slurm
+sbatch scripts/csd3_train_id20_factorized_cmp.slurm
+```
+
+For the main ID200 factorized CPU run after generating/converting
+`datasets/grid_fixed_id200_csd3`, run:
+
+```bash
+sbatch scripts/csd3_train_id200_factorized.slurm
+sbatch scripts/csd3_eval_id200_factorized.slurm
+sbatch scripts/csd3_plot_id200_factorized.slurm
+```
+
+Optional follow-up experiments are provided for a longer context and deeper
+factorized encoder:
+
+```bash
+sbatch scripts/csd3_train_id200_factorized_context8_optional.slurm
+sbatch scripts/csd3_train_id200_factorized_layers6_optional.slurm
 ```
 
 Always summarize before conversion:
