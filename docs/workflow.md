@@ -131,6 +131,19 @@ To use factorized attention while keeping the same dataset and training loop:
   --attention-type factorized
 ```
 
+Training-only input noise can be used as a small rollout-stability regularizer.
+The default `--input-noise-std 0.0` keeps deterministic baseline behavior.
+Values such as `0.005` or `0.01` add Gaussian noise to the input context scaled
+by the fitted input-channel normalizer std. Targets stay clean, and no noise is
+applied during validation, evaluation, or plotting.
+
+```powershell
+.\.venv\Scripts\python.exe -m ml.train --grid datasets\grid_local_smoke --out checkpoints\local_factorized_noise `
+  --epochs 1 --batch 1 --context 4 --horizon 1 --device cpu `
+  --d-model 64 --heads 4 --layers 2 --patch 8 `
+  --attention-type factorized --input-noise-std 0.005
+```
+
 `--horizon 1` and `--patch-t 1` are currently implemented. Larger temporal
 tubelets are the next architecture step because they require changing both
 tokenisation and detokenisation; this pass keeps the stable spatial patch

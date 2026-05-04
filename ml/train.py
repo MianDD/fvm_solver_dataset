@@ -46,6 +46,7 @@ class TrainConfig:
     dropout: float = 0.0
     mlp_ratio: float = 4.0
     attention_type: str = "global"
+    input_noise_std: float = 0.0
     num_workers: int = 0
     save_every: int = 0
     resume: str | None = None
@@ -211,11 +212,17 @@ def save_checkpoint(path: Path, model: FoundationCFDModel, optim, sched,
 
 
 def predict_next(model: FoundationCFDModel, batch: Dict, cfg: TrainConfig,
-                 device: str) -> Tuple[torch.Tensor, torch.Tensor]:
+                 device: str, training: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
     features = batch["input_states"].to(device)
     current = batch["context_states"][:, -1].to(device)
     target = batch["target_states"][:, 0].to(device)
     dt = batch["dt"].to(device)
+    if training and cfg.input_noise_std > 0.0:
+        channel_scale = model.normaliser.std.view(1, 1, -1, 1, 1).to(
+            dtype=features.dtype,
+            device=features.device,
+        )
+        features = features + cfg.input_noise_std * channel_scale * torch.randn_like(features)
     update = model.predict_update(features, normalised=False)[:, -1]
     pred_next = model.integrate_update(
         current,
@@ -230,6 +237,8 @@ def predict_next(model: FoundationCFDModel, batch: Dict, cfg: TrainConfig,
 def train(cfg: TrainConfig, device: str | None = None) -> Dict:
     if cfg.prediction_horizon != 1:
         raise ValueError(HORIZON_ERROR)
+    if cfg.input_noise_std < 0.0:
+        raise ValueError("--input-noise-std must be non-negative.")
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     out_dir = Path(cfg.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -286,6 +295,7 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         f"Prediction mode: {cfg.prediction_mode}  integrator: {cfg.integrator}  "
         f"strides={cfg.strides}  attention={cfg.attention_type}"
     )
+    print(f"Input noise std: {cfg.input_noise_std:g} normalizer-std units (training only)")
     attention_complexity = attention_complexity_dict(cfg, H, W)
     print_attention_complexity(attention_complexity)
 
@@ -340,7 +350,7 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         running = 0.0
         n_batches = 0
         for batch in train_loader:
-            pred, tgt = predict_next(model, batch, cfg, device)
+            pred, tgt = predict_next(model, batch, cfg, device, training=True)
             loss = weighted_mse(pred, tgt)
             optim.zero_grad(set_to_none=True)
             loss.backward()
@@ -409,6 +419,7 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         "physical_derivative_spacing": model_cfg["physical_derivative_spacing"],
         "attention_type": cfg.attention_type,
         "attention_complexity": attention_complexity,
+        "input_noise_std": cfg.input_noise_std,
         "strides": parse_strides(cfg.strides),
     }
     save_json(out_dir / "metrics.json", metrics)
@@ -448,6 +459,8 @@ def main() -> None:
     ap.add_argument("--dropout", type=float, default=0.0)
     ap.add_argument("--mlp-ratio", type=float, default=4.0)
     ap.add_argument("--attention-type", choices=["global", "factorized"], default="global")
+    ap.add_argument("--input-noise-std", type=float, default=0.0,
+                    help="training-only Gaussian input noise in model-normalizer std units")
     ap.add_argument("--use-derivatives", dest="use_derivatives", action="store_true")
     ap.add_argument("--no-derivatives", dest="use_derivatives", action="store_false")
     ap.set_defaults(use_derivatives=False)
@@ -458,6 +471,8 @@ def main() -> None:
     args = ap.parse_args()
     if args.horizon != 1:
         ap.error(HORIZON_ERROR)
+    if args.input_noise_std < 0.0:
+        ap.error("--input-noise-std must be non-negative.")
 
     cfg = TrainConfig(
         grid_dir=args.grid,
@@ -481,6 +496,7 @@ def main() -> None:
         dropout=args.dropout,
         mlp_ratio=args.mlp_ratio,
         attention_type=args.attention_type,
+        input_noise_std=args.input_noise_std,
         use_derivatives=args.use_derivatives,
         derivative_mode=args.derivative_mode,
         use_physical_derivatives=True,

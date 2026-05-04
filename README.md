@@ -114,6 +114,19 @@ channel. Spatial derivatives use physical `dx` and `dy` saved by
 `ml.grid_adapter`; old grid files without spacing metadata fall back to index
 spacing with a warning. Targets remain `[V_x, V_y, rho, T]`.
 
+Training-only input noise is available for rollout robustness experiments.
+`--input-noise-std 0.0` is the deterministic baseline. Small values such as
+`0.005` or `0.01` add Gaussian noise to input context channels, scaled by the
+training normalizer standard deviation; targets, validation, evaluation, and
+plots remain clean.
+
+```powershell
+.\.venv\Scripts\python.exe -m ml.train --grid datasets\grid_local_smoke --out checkpoints\local_factorized_noise `
+  --epochs 1 --batch 1 --context 4 --horizon 1 --device cpu `
+  --d-model 64 --heads 4 --layers 2 --patch 8 `
+  --attention-type factorized --input-noise-std 0.005
+```
+
 `--horizon` is currently fixed to `1`. Multi-horizon training and evaluation
 are not implemented yet.
 
