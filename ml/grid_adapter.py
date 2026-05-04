@@ -11,9 +11,9 @@ import numpy as np
 from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
 
 try:
-    from .pde import DEFAULT_PDE_VEC_NAMES, VISCOSITY_LAW_NAMES
+    from .pde import DEFAULT_PDE_VEC_NAMES, EOS_TYPE_NAMES, VISCOSITY_LAW_NAMES
 except ImportError:  # pragma: no cover - allows direct ``python ml/grid_adapter.py``
-    from pde import DEFAULT_PDE_VEC_NAMES, VISCOSITY_LAW_NAMES
+    from pde import DEFAULT_PDE_VEC_NAMES, EOS_TYPE_NAMES, VISCOSITY_LAW_NAMES
 
 
 CHANNEL_NAMES = ["V_x", "V_y", "rho", "T"]
@@ -23,6 +23,7 @@ PHYSICAL_KEYS = [
     "viscosity_law", "power_law_n", "eos_type", "p_inf",
 ]
 VISCOSITY_LAWS = list(VISCOSITY_LAW_NAMES)
+EOS_TYPES = list(EOS_TYPE_NAMES)
 MESH_KEYS = ["lnscale", "min_A", "max_A", "mesh_seed"]
 TIME_KEYS = ["dt", "save_t", "n_iter", "end_t"]
 
@@ -241,6 +242,11 @@ def viscosity_law_one_hot(law: str | None) -> np.ndarray:
     return np.array([1.0 if law == name else 0.0 for name in VISCOSITY_LAWS], dtype=np.float32)
 
 
+def eos_type_one_hot(eos_type: str | None) -> np.ndarray:
+    eos_type = str(eos_type or "ideal")
+    return np.array([1.0 if eos_type == name else 0.0 for name in EOS_TYPES], dtype=np.float32)
+
+
 def pde_fingerprint(cfg: Dict) -> np.ndarray:
     """Numerical fingerprint used only for diagnostics (NOT fed to model)."""
     base = np.array([
@@ -256,7 +262,15 @@ def pde_fingerprint(cfg: Dict) -> np.ndarray:
     ], dtype=np.float32)
     law = str(cfg.get("viscosity_law", "sutherland"))
     power_law_n = np.array([cfg.get("power_law_n", 0.75)], dtype=np.float32)
-    return np.concatenate([base, viscosity_law_one_hot(law), power_law_n]).astype(np.float32)
+    eos_type = str(cfg.get("eos_type", "ideal"))
+    p_inf = np.array([cfg.get("p_inf", 0.0)], dtype=np.float32)
+    return np.concatenate([
+        base,
+        viscosity_law_one_hot(law),
+        power_law_n,
+        eos_type_one_hot(eos_type),
+        p_inf,
+    ]).astype(np.float32)
 
 
 def pde_fingerprint_names() -> List[str]:

@@ -39,6 +39,7 @@ def _summarize_context_metrics(metrics: Dict) -> Dict:
         "pde_mean_r2": None if pde is None else pde.get("overall", {}).get("mean_continuous_r2"),
         "pde_mean_mae": None if pde is None else pde.get("overall", {}).get("mean_continuous_mae"),
         "pde_law_accuracy": None if pde is None else pde.get("overall", {}).get("law_accuracy"),
+        "pde_eos_accuracy": None if pde is None else pde.get("overall", {}).get("eos_accuracy"),
         "num_windows": metrics.get("n_windows"),
         "metrics_path": metrics.get("metrics_path"),
     }
@@ -86,7 +87,8 @@ def evaluate_context_scaling(grid_dir: str | Path, ckpt_path: str | Path,
             results[key] = summary
             print(
                 f"OK context {context}: mse={summary['mse']} "
-                f"pde_r2={summary['pde_mean_r2']} law_acc={summary['pde_law_accuracy']}"
+                f"pde_r2={summary['pde_mean_r2']} law_acc={summary['pde_law_accuracy']} "
+                f"eos_acc={summary['pde_eos_accuracy']}"
             )
         except (RuntimeError, ValueError) as exc:
             reason = str(exc)

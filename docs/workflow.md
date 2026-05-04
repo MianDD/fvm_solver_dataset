@@ -49,6 +49,11 @@ nearby generalisation tests, and `--family ood_hard` for stress testing. Mesh
 sampling is separate from PDE/physics sampling; enable it with
 `--sample-mesh-params`.
 
+EOS sampling is also family-controlled: `id` remains ideal-gas only,
+`ood_mild` samples both ideal and stiffened-gas examples, and `ood_hard`
+samples stiffened-gas examples. Use `--eos-type ideal` or
+`--eos-type stiffened_gas` to override the family choice explicitly.
+
 The default shear-viscosity law is the original `sutherland` model. To make a
 small constitutive-law variation dataset without changing the FVM fluxes or
 integrators, use:
@@ -75,8 +80,8 @@ prototype can be invoked explicitly for Report 1/Report 2 bridge experiments:
 
 The prototype uses `p = rho R T - p_inf` and
 `c = sqrt(gamma (p + p_inf) / rho)`. Existing commands remain ideal-gas by
-default, and EOS metadata is recorded without changing the current `pde_vec`
-schema.
+default. New grid files append EOS information to `pde_vec`, while old 9D and
+13D grid files remain supported.
 
 For CSD3 runs where random ellipse mesh generation is unstable, use
 `--geometry-mode fixed_ellipse`. This keeps one deterministic ellipse geometry
@@ -115,6 +120,13 @@ Each output `.npz` contains:
   parameters, time settings, validation status, and source folder
 - `cfg_json` for backward-compatible access to the raw simulation config
 - `pde_vec` and `pde_vec_names` for physical-parameter diagnostics
+
+Newly generated grids use a 16D `pde_vec`:
+`[gamma, viscosity, visc_bulk, thermal_cond, C_v, T_0, rho_inf, T_inf,
+v_n_inf, viscosity_law_sutherland, viscosity_law_constant,
+viscosity_law_power_law, power_law_n, eos_type_ideal,
+eos_type_stiffened_gas, p_inf]`. The loader and schema inference still support
+old 9D vectors and the earlier 13D viscosity-law schema.
 
 Old grid files without `mask` still load. The dataset class fills in an
 all-fluid mask, so baseline training remains backward-compatible.
@@ -162,7 +174,7 @@ experiment from temporal context without changing the main next-state target:
   --epochs 2 --batch 1 --context 4 --horizon 1 --device cpu `
   --d-model 64 --heads 4 --layers 2 --patch 8 `
   --pde-aux-loss --pde-normalize --pde-log-transport --pde-aux-weight 0.01 `
-  --pde-cont-weight 1.0 --pde-law-weight 1.0
+  --pde-cont-weight 1.0 --pde-law-weight 1.0 --pde-eos-weight 1.0
 ```
 
 If `--pde-aux-loss` is explicitly requested and a grid file lacks `pde_vec`, the
@@ -174,10 +186,11 @@ dimensionless values, tiny transport coefficients, temperature-scale values,
 one-hot viscosity-law entries, and `power_law_n`. Training-set-only mean/std are
 saved in the checkpoint. Viscosity, bulk viscosity, and thermal conductivity are
 positive transport coefficients, so they are log-transformed before computing
-normalization statistics. With the new 13D schema, continuous dimensions use
-normalized MSE while the viscosity-law slice uses cross entropy; old 9D
-`pde_vec` files use normalized MSE over all dimensions, with indices 1, 2, and 3
-log-normalized by default.
+normalization statistics. With the new 16D schema, continuous dimensions use
+normalized MSE while the viscosity-law and EOS-type slices use cross entropy;
+`p_inf` is a continuous regression target. Old 13D `pde_vec` files still expose
+viscosity-law classification, and old 9D files use normalized MSE over all
+dimensions, with indices 1, 2, and 3 log-normalized by default.
 
 The default attention path is the original flattened global Transformer:
 `--attention-type global`, so old commands and checkpoints remain compatible.
@@ -268,11 +281,12 @@ If the checkpoint includes a PDE auxiliary head and the grid files include
   --device cpu --batch 1 --rollout-steps 4,8
 ```
 
-The PDE metrics include continuous-parameter MAE/RMSE/R2 and, when the 13D
-schema is present, viscosity-law accuracy, per-class accuracy, and a confusion
-matrix. If grid metadata contains family labels such as `id`, `ood_mild`, or
-`ood_hard`, `pde_metrics.json` also includes a `by_family` section for Report 1
-tables.
+The PDE metrics include continuous-parameter MAE/RMSE/R2 and, when categorical
+slices are present, viscosity-law and EOS-type accuracy, per-class accuracy,
+and confusion matrices. If grid metadata contains family labels such as `id`,
+`ood_mild`, or `ood_hard`, `pde_metrics.json` also includes a `by_family`
+section for Report 1 tables. EOS identification metrics are only meaningful on
+datasets that contain both ideal and stiffened-gas samples.
 
 ## F. Plot Predictions
 
@@ -296,8 +310,8 @@ For Report 1 metric figures from `metrics.json` or `pde_metrics.json`:
 ```
 
 This produces available plots such as `pde_r2_bar.png`, `pde_mae_bar.png`,
-`viscosity_law_confusion.png`, and `rollout_error.png`. Missing metric sections
-are skipped gracefully.
+`viscosity_law_confusion.png`, `eos_type_confusion.png`, and
+`rollout_error.png`. Missing metric sections are skipped gracefully.
 
 Grouped ID/OOD plots from separate evaluation outputs:
 
@@ -329,7 +343,8 @@ mechanism used for implicit PDE identification.
 ```
 
 The output JSON records `mse`, `mae`, optional PDE mean R2, optional
-viscosity-law accuracy, and the number of windows for each requested context.
+viscosity-law accuracy, optional EOS-type accuracy, and the number of windows
+for each requested context.
 If a context is too long for the dataset, or if a `learned_absolute` checkpoint
 is asked to exceed its stored `max_context`, that context is skipped with a
 recorded reason instead of crashing. `sinusoidal` checkpoints can be evaluated

@@ -146,7 +146,8 @@ Important sweep options:
   the family-sampled constitutive law
 - `--power-law-n` sets the exponent for `power_law` viscosity
 - `--eos-type {family,ideal,stiffened_gas}` optionally selects the equation of
-  state; default/family behaviour is still `ideal`
+  state; `family` uses the selected family distribution, while `id` remains
+  ideal-gas only
 - `--p-inf` sets the stiffened-gas pressure offset when `--eos-type stiffened_gas`
 - `--max-mesh-retries` and `--mesh-attempt-timeout-s` bound mesh-generation
   failures
@@ -154,6 +155,10 @@ Important sweep options:
 
 Every simulation folder receives a `status.json`. Successful, failed, and
 invalid simulations are all recorded in `MANIFEST.json`.
+
+Family EOS sampling is conservative: `id` remains ideal-gas only,
+`ood_mild` samples both ideal and stiffened-gas cases, and `ood_hard` samples
+stiffened-gas cases with larger `p_inf`. CLI overrides still take precedence.
 
 Summarize a raw sweep:
 
@@ -181,6 +186,13 @@ Each grid `.npz` includes:
 - `x_coords`, `y_coords`, `dx`, `dy`, and `bbox`
 - `metadata_json` and `cfg_json`
 - `pde_vec` and `pde_vec_names` for physical-parameter diagnostics
+
+Newly generated grids use a 16D `pde_vec`:
+`[gamma, viscosity, visc_bulk, thermal_cond, C_v, T_0, rho_inf, T_inf,
+v_n_inf, viscosity_law_sutherland, viscosity_law_constant,
+viscosity_law_power_law, power_law_n, eos_type_ideal,
+eos_type_stiffened_gas, p_inf]`. Older 9D and 13D vectors are still inferred
+and supported.
 
 Older grid files without `mask` still load: the dataset class creates an
 all-fluid mask and prints warnings when mask-dependent options are requested.
@@ -217,8 +229,9 @@ Current model options:
   in the checkpoint
 - `--pde-log-transport` is also enabled by default and normalizes viscosity,
   bulk viscosity, and thermal conductivity in log-space
-- `--pde-cont-weight` and `--pde-law-weight` weight the continuous-parameter
-  regression and viscosity-law classification terms inside the auxiliary loss
+- `--pde-cont-weight`, `--pde-law-weight`, and `--pde-eos-weight` weight the
+  continuous-parameter regression, viscosity-law classification, and EOS-type
+  classification terms inside the auxiliary loss
 - `--pos-encoding learned_absolute` is the default checkpoint-compatible
   position embedding; `--pos-encoding sinusoidal` is parameter-free and less
   tied to learned position-table sizes
@@ -288,10 +301,12 @@ normalizes continuous parameters using train-set-only mean/std by default.
 Transport coefficients are especially small and positive, so viscosity,
 bulk viscosity, and thermal conductivity are log-transformed before computing
 their normalization statistics. This avoids raw-scale domination and makes
-relative transport-coefficient errors more meaningful. For the current 13D
-schema, the viscosity-law one-hot slice is treated as classification logits and
-trained with cross entropy; old 9D `pde_vec` files fall back to normalized MSE
-over all dimensions, with the same log-space treatment for indices 1, 2, and 3.
+relative transport-coefficient errors more meaningful. For newly generated 16D
+grids, the viscosity-law and EOS one-hot slices are treated as classification
+logits and trained with cross entropy; `p_inf` remains a continuous regression
+target. Old 13D `pde_vec` files still provide viscosity-law classification, and
+old 9D files fall back to normalized MSE over all dimensions, with the same
+log-space treatment for indices 1, 2, and 3.
 
 Example Report 1 training command:
 
@@ -302,7 +317,7 @@ Example Report 1 training command:
   --attention-type factorized --prediction-mode derivative --integrator euler `
   --use-derivatives --use-mask-channel --mask-loss `
   --pde-aux-loss --pde-normalize --pde-log-transport --pde-aux-weight 0.01 `
-  --pde-cont-weight 1.0 --pde-law-weight 1.0
+  --pde-cont-weight 1.0 --pde-law-weight 1.0 --pde-eos-weight 1.0
 ```
 
 The solver now supports three shear-viscosity laws: `sutherland` (the original
@@ -315,8 +330,10 @@ An optional `stiffened_gas` EOS prototype is available behind explicit flags.
 The default remains `ideal`, so existing runs are unchanged. The prototype uses
 `p = rho R T - p_inf` and `c = sqrt(gamma (p + p_inf) / rho)` with simple
 floors for numerical safety. EOS metadata is saved in config/status/manifest and
-grid metadata; the current `pde_vec` schema is intentionally left unchanged for
-backward compatibility.
+grid metadata; new grids append `eos_type_ideal`, `eos_type_stiffened_gas`, and
+`p_inf` to `pde_vec` so the PDE auxiliary head can identify EOS variation.
+EOS identification metrics are meaningful only for datasets that actually
+contain both ideal and stiffened-gas examples.
 
 The temporal context window supports implicit PDE identification from observed
 dynamics, but it is not identical to TabPFN-style explicit in-context learning.
@@ -348,7 +365,8 @@ Evaluation and plotting load model settings from the checkpoint by default,
 including derivative features, prediction mode, integrator, and strides.
 If the checkpoint has a PDE auxiliary head and the grid files include
 `pde_vec`, `ml.evaluate` also writes `pde_metrics.json` with continuous
-parameter MAE/RMSE/R2 and viscosity-law accuracy/confusion-matrix metrics.
+parameter MAE/RMSE/R2, viscosity-law accuracy/confusion-matrix metrics, and
+EOS-type accuracy/confusion-matrix metrics when the 16D schema is present.
 When family labels are available in grid metadata, the PDE metrics also include
 `by_family` entries for ID/OOD breakdowns.
 

@@ -23,7 +23,11 @@ BASE_PDE_NAMES = [
 VISCOSITY_LAW_NAMES = ["sutherland", "constant", "power_law"]
 VISCOSITY_LAW_VEC_NAMES = [f"viscosity_law_{name}" for name in VISCOSITY_LAW_NAMES]
 POWER_LAW_N_NAME = "power_law_n"
-DEFAULT_PDE_VEC_NAMES = BASE_PDE_NAMES + VISCOSITY_LAW_VEC_NAMES + [POWER_LAW_N_NAME]
+OLD_13D_PDE_VEC_NAMES = BASE_PDE_NAMES + VISCOSITY_LAW_VEC_NAMES + [POWER_LAW_N_NAME]
+EOS_TYPE_NAMES = ["ideal", "stiffened_gas"]
+EOS_TYPE_VEC_NAMES = [f"eos_type_{name}" for name in EOS_TYPE_NAMES]
+P_INF_NAME = "p_inf"
+DEFAULT_PDE_VEC_NAMES = OLD_13D_PDE_VEC_NAMES + EOS_TYPE_VEC_NAMES + [P_INF_NAME]
 DEFAULT_LOG_PDE_NAMES = ["viscosity", "visc_bulk", "thermal_cond"]
 DEFAULT_LOG_INDICES = [1, 2, 3]
 
@@ -33,6 +37,8 @@ def default_pde_names(dim: int) -> List[str]:
     dim = int(dim)
     if dim == len(DEFAULT_PDE_VEC_NAMES):
         return list(DEFAULT_PDE_VEC_NAMES)
+    if dim == len(OLD_13D_PDE_VEC_NAMES):
+        return list(OLD_13D_PDE_VEC_NAMES)
     if dim == len(BASE_PDE_NAMES):
         return list(BASE_PDE_NAMES)
     return [f"pde_{i}" for i in range(dim)]
@@ -42,10 +48,9 @@ def infer_pde_schema(names: Sequence[str] | None = None,
                      pde_dim: int | None = None) -> Dict:
     """Infer continuous and categorical slices from pde_vec names.
 
-    The current 13D layout is:
-    continuous base parameters, three viscosity-law one-hot entries, and
-    ``power_law_n``.  The old 9D layout has no categorical slice and is treated
-    as all-continuous for backward compatibility.
+    The current 16D layout is the previous 13D layout plus two EOS one-hot
+    entries and ``p_inf``.  The old 9D and 13D layouts are inferred explicitly
+    so older datasets and checkpoints remain usable.
     """
     if names:
         vec_names = [str(name) for name in names]
@@ -60,9 +65,13 @@ def infer_pde_schema(names: Sequence[str] | None = None,
     law_indices: List[int] = []
     if all(name in vec_names for name in VISCOSITY_LAW_VEC_NAMES):
         law_indices = [vec_names.index(name) for name in VISCOSITY_LAW_VEC_NAMES]
-    law_index_set = set(law_indices)
-    continuous_indices = [i for i in range(dim) if i not in law_index_set]
+    eos_indices: List[int] = []
+    if all(name in vec_names for name in EOS_TYPE_VEC_NAMES):
+        eos_indices = [vec_names.index(name) for name in EOS_TYPE_VEC_NAMES]
+    categorical_index_set = set(law_indices) | set(eos_indices)
+    continuous_indices = [i for i in range(dim) if i not in categorical_index_set]
     power_law_n_index = vec_names.index(POWER_LAW_N_NAME) if POWER_LAW_N_NAME in vec_names else None
+    p_inf_index = vec_names.index(P_INF_NAME) if P_INF_NAME in vec_names else None
     return {
         "pde_vec_names": vec_names,
         "pde_dim": dim,
@@ -72,6 +81,10 @@ def infer_pde_schema(names: Sequence[str] | None = None,
         "viscosity_law_names": list(VISCOSITY_LAW_NAMES) if law_indices else [],
         "power_law_n_index": power_law_n_index,
         "has_viscosity_law": bool(law_indices),
+        "eos_type_indices": eos_indices,
+        "eos_type_names": list(EOS_TYPE_NAMES) if eos_indices else [],
+        "has_eos_type": bool(eos_indices),
+        "p_inf_index": p_inf_index,
     }
 
 
@@ -168,7 +181,8 @@ def pde_loss_components(pred: torch.Tensor,
                         normalizer: Dict | None = None,
                         normalize: bool = True,
                         cont_weight: float = 1.0,
-                        law_weight: float = 1.0) -> Dict[str, torch.Tensor]:
+                        law_weight: float = 1.0,
+                        eos_weight: float = 1.0) -> Dict[str, torch.Tensor]:
     """Compute schema-aware PDE auxiliary losses.
 
     The continuous slice is regressed in physical units, but the MSE is computed
@@ -184,6 +198,8 @@ def pde_loss_components(pred: torch.Tensor,
     cont_loss = zero
     law_loss = zero
     law_acc = zero
+    eos_loss = zero
+    eos_acc = zero
 
     cont_indices = [int(i) for i in schema.get("continuous_indices", [])]
     if cont_indices:
@@ -209,12 +225,26 @@ def pde_loss_components(pred: torch.Tensor,
         law_loss = F.cross_entropy(logits, target_class)
         law_acc = (logits.argmax(dim=1) == target_class).to(dtype=pred.dtype).mean()
 
-    total = float(cont_weight) * cont_loss + float(law_weight) * law_loss
+    eos_indices = [int(i) for i in schema.get("eos_type_indices", [])]
+    if eos_indices:
+        idx = torch.as_tensor(eos_indices, dtype=torch.long, device=pred.device)
+        logits = pred.index_select(1, idx)
+        target_class = true.index_select(1, idx).argmax(dim=1)
+        eos_loss = F.cross_entropy(logits, target_class)
+        eos_acc = (logits.argmax(dim=1) == target_class).to(dtype=pred.dtype).mean()
+
+    total = (
+        float(cont_weight) * cont_loss
+        + float(law_weight) * law_loss
+        + float(eos_weight) * eos_loss
+    )
     return {
         "total": total,
         "continuous": cont_loss,
         "law": law_loss,
         "law_accuracy": law_acc.detach(),
+        "eos": eos_loss,
+        "eos_accuracy": eos_acc.detach(),
     }
 
 
@@ -223,6 +253,31 @@ def _float_or_none(value: float | np.floating) -> float | None:
     if not np.isfinite(value):
         return None
     return value
+
+
+def _categorical_metrics(pred: np.ndarray, true: np.ndarray,
+                         indices: Sequence[int], names: Sequence[str]) -> Dict | None:
+    indices = [int(i) for i in indices]
+    if not indices:
+        return None
+    true_class = true[:, indices].argmax(axis=1)
+    pred_class = pred[:, indices].argmax(axis=1)
+    n_cls = len(indices)
+    confusion = np.zeros((n_cls, n_cls), dtype=np.int64)
+    for t, p in zip(true_class, pred_class):
+        confusion[int(t), int(p)] += 1
+    per_class = {}
+    for i, name in enumerate(names):
+        denom = int(confusion[i].sum())
+        per_class[str(name)] = None if denom == 0 else float(confusion[i, i] / denom)
+    return {
+        "indices": indices,
+        "names": [str(name) for name in names],
+        "accuracy": float(np.mean(pred_class == true_class)) if len(true_class) else None,
+        "confusion_matrix": confusion.tolist(),
+        "confusion_matrix_rows_true_cols_pred": True,
+        "per_class_accuracy": per_class,
+    }
 
 
 def compute_pde_metrics(pred: np.ndarray,
@@ -307,37 +362,31 @@ def compute_pde_metrics(pred: np.ndarray,
     if nmaes:
         continuous["mean_normalized_mae"] = float(np.mean(nmaes))
 
-    law_metrics = None
     law_indices = [int(i) for i in schema.get("viscosity_law_indices", [])]
-    if law_indices:
-        law_names = list(schema.get("viscosity_law_names", VISCOSITY_LAW_NAMES))
-        true_class = true[:, law_indices].argmax(axis=1)
-        pred_class = pred[:, law_indices].argmax(axis=1)
-        n_cls = len(law_indices)
-        confusion = np.zeros((n_cls, n_cls), dtype=np.int64)
-        for t, p in zip(true_class, pred_class):
-            confusion[int(t), int(p)] += 1
-        per_class = {}
-        for i, name in enumerate(law_names):
-            denom = int(confusion[i].sum())
-            per_class[name] = None if denom == 0 else float(confusion[i, i] / denom)
-        law_metrics = {
-            "indices": law_indices,
-            "names": law_names,
-            "accuracy": float(np.mean(pred_class == true_class)) if len(true_class) else None,
-            "confusion_matrix": confusion.tolist(),
-            "confusion_matrix_rows_true_cols_pred": True,
-            "per_class_accuracy": per_class,
-        }
+    law_metrics = _categorical_metrics(
+        pred,
+        true,
+        law_indices,
+        list(schema.get("viscosity_law_names", VISCOSITY_LAW_NAMES)),
+    )
+    eos_indices = [int(i) for i in schema.get("eos_type_indices", [])]
+    eos_metrics = _categorical_metrics(
+        pred,
+        true,
+        eos_indices,
+        list(schema.get("eos_type_names", EOS_TYPE_NAMES)),
+    )
 
     return {
         "pde_schema": schema,
         "n_samples": int(pred.shape[0]),
         "continuous": continuous,
         "viscosity_law": law_metrics,
+        "eos_type": eos_metrics,
         "overall": {
             "mean_continuous_r2": continuous["mean_r2"],
             "mean_continuous_mae": continuous["mean_mae"],
             "law_accuracy": None if law_metrics is None else law_metrics["accuracy"],
+            "eos_accuracy": None if eos_metrics is None else eos_metrics["accuracy"],
         },
     }

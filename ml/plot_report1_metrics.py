@@ -65,10 +65,10 @@ def _plot_continuous_bars(pde: Dict, out_dir: Path) -> None:
         print("Skipping PDE R^2 plot: all R^2 values are undefined.")
 
 
-def _plot_confusion(pde: Dict, out_dir: Path) -> None:
-    law = pde.get("viscosity_law")
-    if not law or not law.get("confusion_matrix"):
-        print("Skipping viscosity-law confusion plot: metrics not available.")
+def _plot_categorical_confusion(section: Dict | None, out_dir: Path, *,
+                                title: str, filename: str) -> None:
+    if not section or not section.get("confusion_matrix"):
+        print(f"Skipping {filename}: metrics not available.")
         return
     try:
         import matplotlib
@@ -78,8 +78,8 @@ def _plot_confusion(pde: Dict, out_dir: Path) -> None:
         print(f"Skipping confusion plot: matplotlib unavailable ({exc})")
         return
 
-    matrix = np.asarray(law["confusion_matrix"], dtype=np.int64)
-    names = law.get("names") or [str(i) for i in range(matrix.shape[0])]
+    matrix = np.asarray(section["confusion_matrix"], dtype=np.int64)
+    names = section.get("names") or [str(i) for i in range(matrix.shape[0])]
     fig, ax = plt.subplots(figsize=(4.5, 4.0))
     im = ax.imshow(matrix, cmap="Blues")
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
@@ -89,13 +89,28 @@ def _plot_confusion(pde: Dict, out_dir: Path) -> None:
     ax.set_yticklabels(names)
     ax.set_xlabel("predicted")
     ax.set_ylabel("true")
-    ax.set_title("Viscosity-law confusion")
+    ax.set_title(title)
     for i in range(matrix.shape[0]):
         for j in range(matrix.shape[1]):
             ax.text(j, i, str(int(matrix[i, j])), ha="center", va="center", color="black")
     fig.tight_layout()
-    fig.savefig(out_dir / "viscosity_law_confusion.png", dpi=180)
+    fig.savefig(out_dir / filename, dpi=180)
     plt.close(fig)
+
+
+def _plot_confusion(pde: Dict, out_dir: Path) -> None:
+    _plot_categorical_confusion(
+        pde.get("viscosity_law"),
+        out_dir,
+        title="Viscosity-law confusion",
+        filename="viscosity_law_confusion.png",
+    )
+    _plot_categorical_confusion(
+        pde.get("eos_type"),
+        out_dir,
+        title="EOS-type confusion",
+        filename="eos_type_confusion.png",
+    )
 
 
 def _plot_rollout(metrics: Dict, out_dir: Path) -> None:
@@ -176,6 +191,7 @@ def _grouped_records_from_metrics_list(value: str) -> List[Dict]:
             "pde": pde,
             "mean_r2": None if pde is None else pde.get("overall", {}).get("mean_continuous_r2"),
             "law_accuracy": None if pde is None else pde.get("overall", {}).get("law_accuracy"),
+            "eos_accuracy": None if pde is None else pde.get("overall", {}).get("eos_accuracy"),
             "rollout_mse": _mean_rollout_mse(metrics),
         })
     return records
@@ -190,6 +206,7 @@ def _grouped_records_from_by_family(pde: Dict) -> List[Dict]:
             "pde": fam_pde,
             "mean_r2": fam_pde.get("overall", {}).get("mean_continuous_r2"),
             "law_accuracy": fam_pde.get("overall", {}).get("law_accuracy"),
+            "eos_accuracy": fam_pde.get("overall", {}).get("eos_accuracy"),
             "rollout_mse": None,
         })
     return records
@@ -237,6 +254,14 @@ def _plot_grouped(records: List[Dict], out_dir: Path) -> None:
     )
     _plot_grouped_bar(
         records,
+        "eos_accuracy",
+        "eos_type_accuracy_by_family.png",
+        "accuracy",
+        "EOS-type accuracy by family",
+        out_dir,
+    )
+    _plot_grouped_bar(
+        records,
         "mean_r2",
         "pde_mean_r2_by_family.png",
         "mean R^2",
@@ -278,6 +303,7 @@ def _plot_context_scaling(payload: Dict, out_dir: Path) -> None:
         ("mse", "context_scaling_mse.png", "one-step MSE", "Context scaling: prediction MSE"),
         ("pde_mean_r2", "context_scaling_pde_r2.png", "mean PDE R^2", "Context scaling: PDE R^2"),
         ("pde_law_accuracy", "context_scaling_law_accuracy.png", "law accuracy", "Context scaling: viscosity-law accuracy"),
+        ("pde_eos_accuracy", "context_scaling_eos_accuracy.png", "EOS accuracy", "Context scaling: EOS-type accuracy"),
     ]
     for key, filename, ylabel, title in specs:
         pairs = _context_pairs(payload, key)

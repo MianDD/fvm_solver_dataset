@@ -55,6 +55,8 @@ class BC:
 
             # Isentropic boundary condition
             case BCMode.Isentropic:
+                if getattr(phy_setup, "eos_type", "ideal") != "ideal":
+                    raise NotImplementedError("BC_isentropic currently supports ideal gas only.")
                 self.set_bc_U_face = self.BC_isentropic
 
                 self.gamma = phy_setup.gamma

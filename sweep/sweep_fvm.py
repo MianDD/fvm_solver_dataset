@@ -102,6 +102,8 @@ FAMILY_SPECS: Dict[str, FamilySpec] = {
             "max_A": (0.04, 0.08),
         },
         viscosity_laws=("sutherland",),
+        eos_types=("ideal",),
+        p_inf=(0.0, 0.0),
     ),
     "ood_mild": FamilySpec(
         name="ood_mild",
@@ -128,6 +130,8 @@ FAMILY_SPECS: Dict[str, FamilySpec] = {
         },
         viscosity_laws=("sutherland", "constant", "power_law"),
         power_law_n=(0.55, 0.95),
+        eos_types=("ideal", "stiffened_gas"),
+        p_inf=(0.0, 100.0),
     ),
     "ood_hard": FamilySpec(
         name="ood_hard",
@@ -154,6 +158,8 @@ FAMILY_SPECS: Dict[str, FamilySpec] = {
         },
         viscosity_laws=("constant", "power_law"),
         power_law_n=(0.4, 1.2),
+        eos_types=("stiffened_gas",),
+        p_inf=(50.0, 300.0),
     ),
 }
 

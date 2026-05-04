@@ -63,6 +63,7 @@ class TrainConfig:
     pde_log_eps: float = 1e-12
     pde_cont_weight: float = 1.0
     pde_law_weight: float = 1.0
+    pde_eos_weight: float = 1.0
     pde_dim: int = 0
     num_workers: int = 0
     save_every: int = 0
@@ -189,6 +190,7 @@ def model_config_dict(cfg: TrainConfig, C_in: int, H: int, W: int) -> Dict:
         "pde_log_eps": cfg.pde_log_eps,
         "pde_cont_weight": cfg.pde_cont_weight,
         "pde_law_weight": cfg.pde_law_weight,
+        "pde_eos_weight": cfg.pde_eos_weight,
         "pde_dim": cfg.pde_dim if cfg.pde_aux_loss else 0,
         "strides": parse_strides(cfg.strides),
     }
@@ -302,6 +304,8 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         raise ValueError("--pde-cont-weight must be non-negative.")
     if cfg.pde_law_weight < 0.0:
         raise ValueError("--pde-law-weight must be non-negative.")
+    if cfg.pde_eos_weight < 0.0:
+        raise ValueError("--pde-eos-weight must be non-negative.")
     if cfg.pde_log_eps <= 0.0:
         raise ValueError("--pde-log-eps must be positive.")
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -407,9 +411,11 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
     )
     if cfg.pde_aux_loss:
         law_status = "enabled" if pde_schema.get("has_viscosity_law") else "not available"
+        eos_status = "enabled" if pde_schema.get("has_eos_type") else "not available"
         print(
             f"PDE aux normalization: {'enabled' if cfg.pde_normalize else 'disabled'}  "
-            f"pde_dim={cfg.pde_dim}  law_classification={law_status}"
+            f"pde_dim={cfg.pde_dim}  law_classification={law_status}  "
+            f"eos_classification={eos_status}"
         )
         print(f"  pde_mean: {np.array(pde_normalizer['mean']).round(6).tolist() if pde_normalizer else 'not used'}")
         print(f"  pde_std : {np.array(pde_normalizer['std']).round(6).tolist() if pde_normalizer else 'not used'}")
@@ -443,6 +449,7 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
             "pde_log_eps": cfg.pde_log_eps,
             "pde_cont_weight": cfg.pde_cont_weight,
             "pde_law_weight": cfg.pde_law_weight,
+            "pde_eos_weight": cfg.pde_eos_weight,
         })
     print(f"Model params: {count_params(model):,}")
 
@@ -477,6 +484,10 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         "val_pde_law_loss": [],
         "train_pde_law_acc": [],
         "val_pde_law_acc": [],
+        "train_pde_eos_loss": [],
+        "val_pde_eos_loss": [],
+        "train_pde_eos_acc": [],
+        "val_pde_eos_acc": [],
         "epoch_time": [],
         "lr": [],
     }
@@ -497,6 +508,10 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
             "val_pde_law_loss": [],
             "train_pde_law_acc": [],
             "val_pde_law_acc": [],
+            "train_pde_eos_loss": [],
+            "val_pde_eos_loss": [],
+            "train_pde_eos_acc": [],
+            "val_pde_eos_acc": [],
         }.items():
             history.setdefault(key, value)
         start_epoch = int(ckpt.get("epoch", -1)) + 1
@@ -512,6 +527,8 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         running_pde_cont = 0.0
         running_pde_law = 0.0
         running_pde_law_acc = 0.0
+        running_pde_eos = 0.0
+        running_pde_eos_acc = 0.0
         n_batches = 0
         for batch in train_loader:
             pred, tgt, pred_pde, true_pde = predict_next(model, batch, cfg, device, training=True)
@@ -526,17 +543,22 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
                     normalize=cfg.pde_normalize,
                     cont_weight=cfg.pde_cont_weight,
                     law_weight=cfg.pde_law_weight,
+                    eos_weight=cfg.pde_eos_weight,
                 )
                 pde_loss = pde_comp["total"]
                 pde_cont_loss = pde_comp["continuous"]
                 pde_law_loss = pde_comp["law"]
                 pde_law_acc = pde_comp["law_accuracy"]
+                pde_eos_loss = pde_comp["eos"]
+                pde_eos_acc = pde_comp["eos_accuracy"]
                 loss = pred_loss + cfg.pde_aux_weight * pde_loss
             else:
                 pde_loss = torch.zeros((), dtype=pred_loss.dtype, device=pred_loss.device)
                 pde_cont_loss = pde_loss
                 pde_law_loss = pde_loss
                 pde_law_acc = pde_loss
+                pde_eos_loss = pde_loss
+                pde_eos_acc = pde_loss
                 loss = pred_loss
             optim.zero_grad(set_to_none=True)
             loss.backward()
@@ -549,6 +571,8 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
             running_pde_cont += pde_cont_loss.item()
             running_pde_law += pde_law_loss.item()
             running_pde_law_acc += pde_law_acc.item()
+            running_pde_eos += pde_eos_loss.item()
+            running_pde_eos_acc += pde_eos_acc.item()
             n_batches += 1
         train_loss = running / max(1, n_batches)
         train_pred_loss = running_pred / max(1, n_batches)
@@ -556,6 +580,8 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         train_pde_cont_loss = running_pde_cont / max(1, n_batches)
         train_pde_law_loss = running_pde_law / max(1, n_batches)
         train_pde_law_acc = running_pde_law_acc / max(1, n_batches)
+        train_pde_eos_loss = running_pde_eos / max(1, n_batches)
+        train_pde_eos_acc = running_pde_eos_acc / max(1, n_batches)
 
         model.eval()
         with torch.no_grad():
@@ -565,6 +591,8 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
             val_pde_cont_running = 0.0
             val_pde_law_running = 0.0
             val_pde_law_acc_running = 0.0
+            val_pde_eos_running = 0.0
+            val_pde_eos_acc_running = 0.0
             val_batches = 0
             for batch in val_loader:
                 pred, tgt, pred_pde, true_pde = predict_next(model, batch, cfg, device)
@@ -579,17 +607,22 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
                         normalize=cfg.pde_normalize,
                         cont_weight=cfg.pde_cont_weight,
                         law_weight=cfg.pde_law_weight,
+                        eos_weight=cfg.pde_eos_weight,
                     )
                     pde_loss = pde_comp["total"]
                     pde_cont_loss = pde_comp["continuous"]
                     pde_law_loss = pde_comp["law"]
                     pde_law_acc = pde_comp["law_accuracy"]
+                    pde_eos_loss = pde_comp["eos"]
+                    pde_eos_acc = pde_comp["eos_accuracy"]
                     loss = pred_loss + cfg.pde_aux_weight * pde_loss
                 else:
                     pde_loss = torch.zeros((), dtype=pred_loss.dtype, device=pred_loss.device)
                     pde_cont_loss = pde_loss
                     pde_law_loss = pde_loss
                     pde_law_acc = pde_loss
+                    pde_eos_loss = pde_loss
+                    pde_eos_acc = pde_loss
                     loss = pred_loss
                 val_running += loss.item()
                 val_pred_running += pred_loss.item()
@@ -597,6 +630,8 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
                 val_pde_cont_running += pde_cont_loss.item()
                 val_pde_law_running += pde_law_loss.item()
                 val_pde_law_acc_running += pde_law_acc.item()
+                val_pde_eos_running += pde_eos_loss.item()
+                val_pde_eos_acc_running += pde_eos_acc.item()
                 val_batches += 1
             val_loss = val_running / max(1, val_batches)
             val_pred_loss = val_pred_running / max(1, val_batches)
@@ -604,6 +639,8 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
             val_pde_cont_loss = val_pde_cont_running / max(1, val_batches)
             val_pde_law_loss = val_pde_law_running / max(1, val_batches)
             val_pde_law_acc = val_pde_law_acc_running / max(1, val_batches)
+            val_pde_eos_loss = val_pde_eos_running / max(1, val_batches)
+            val_pde_eos_acc = val_pde_eos_acc_running / max(1, val_batches)
 
         epoch_time = time.time() - t0
         history["train_loss"].append(train_loss)
@@ -618,6 +655,10 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         history["val_pde_law_loss"].append(val_pde_law_loss)
         history["train_pde_law_acc"].append(train_pde_law_acc)
         history["val_pde_law_acc"].append(val_pde_law_acc)
+        history["train_pde_eos_loss"].append(train_pde_eos_loss)
+        history["val_pde_eos_loss"].append(val_pde_eos_loss)
+        history["train_pde_eos_acc"].append(train_pde_eos_acc)
+        history["val_pde_eos_acc"].append(val_pde_eos_acc)
         history["epoch_time"].append(epoch_time)
         history["lr"].append(float(optim.param_groups[0]["lr"]))
         print(
@@ -627,6 +668,8 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
             f"cont={train_pde_cont_loss:.3e}/{val_pde_cont_loss:.3e} "
             f"law={train_pde_law_loss:.3e}/{val_pde_law_loss:.3e} "
             f"law_acc={train_pde_law_acc:.2f}/{val_pde_law_acc:.2f} "
+            f"eos={train_pde_eos_loss:.3e}/{val_pde_eos_loss:.3e} "
+            f"eos_acc={train_pde_eos_acc:.2f}/{val_pde_eos_acc:.2f} "
             f"lr={history['lr'][-1]:.3e} t={epoch_time:.1f}s"
         )
 
@@ -666,6 +709,10 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         "final_val_pde_law_loss": history["val_pde_law_loss"][-1],
         "final_train_pde_law_acc": history["train_pde_law_acc"][-1],
         "final_val_pde_law_acc": history["val_pde_law_acc"][-1],
+        "final_train_pde_eos_loss": history["train_pde_eos_loss"][-1],
+        "final_val_pde_eos_loss": history["val_pde_eos_loss"][-1],
+        "final_train_pde_eos_acc": history["train_pde_eos_acc"][-1],
+        "final_val_pde_eos_acc": history["val_pde_eos_acc"][-1],
         "n_train_sims": len(train_paths),
         "n_val_sims": len(val_paths),
         "n_train_windows": len(train_ds),
@@ -688,6 +735,7 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         "pde_log_eps": cfg.pde_log_eps,
         "pde_cont_weight": cfg.pde_cont_weight,
         "pde_law_weight": cfg.pde_law_weight,
+        "pde_eos_weight": cfg.pde_eos_weight,
         "pde_dim": cfg.pde_dim if cfg.pde_aux_loss else 0,
         "pde_schema": pde_schema,
         "pde_normalizer": pde_normalizer,
@@ -757,6 +805,8 @@ def main() -> None:
                     help="weight for continuous PDE regression inside the auxiliary loss")
     ap.add_argument("--pde-law-weight", type=float, default=1.0,
                     help="weight for viscosity-law classification inside the auxiliary loss")
+    ap.add_argument("--pde-eos-weight", type=float, default=1.0,
+                    help="weight for EOS-type classification inside the auxiliary loss")
     ap.add_argument("--pde-dim", type=int, default=0,
                     help="PDE auxiliary output dimension; inferred from pde_vec when 0")
     ap.add_argument("--use-derivatives", dest="use_derivatives", action="store_true")
@@ -777,6 +827,8 @@ def main() -> None:
         ap.error("--pde-cont-weight must be non-negative.")
     if args.pde_law_weight < 0.0:
         ap.error("--pde-law-weight must be non-negative.")
+    if args.pde_eos_weight < 0.0:
+        ap.error("--pde-eos-weight must be non-negative.")
     if args.pde_log_eps <= 0.0:
         ap.error("--pde-log-eps must be positive.")
 
@@ -813,6 +865,7 @@ def main() -> None:
         pde_log_eps=args.pde_log_eps,
         pde_cont_weight=args.pde_cont_weight,
         pde_law_weight=args.pde_law_weight,
+        pde_eos_weight=args.pde_eos_weight,
         pde_dim=args.pde_dim,
         use_derivatives=args.use_derivatives,
         derivative_mode=args.derivative_mode,
