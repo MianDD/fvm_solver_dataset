@@ -62,6 +62,22 @@ integrators, use:
 Supported laws are `sutherland`, `constant`, and `power_law`. This is a first
 controlled constitutive-relation variation, not a generic PDE-template system.
 
+Ideal gas remains the default equation of state. A minimal stiffened-gas
+prototype can be invoked explicitly for Report 1/Report 2 bridge experiments:
+
+```powershell
+.\.venv\Scripts\python.exe -m sweep.sweep_fvm --out datasets\raw_stiffened_smoke `
+  --n 1 --family id --geometry-mode fixed_ellipse --device cpu `
+  --eos-type stiffened_gas --p-inf 0.001 `
+  --n-iter 20 --save-t 0.001 --dt 5e-4 `
+  --min-A 0.2 --max-A 0.4 --lnscale 3
+```
+
+The prototype uses `p = rho R T - p_inf` and
+`c = sqrt(gamma (p + p_inf) / rho)`. Existing commands remain ideal-gas by
+default, and EOS metadata is recorded without changing the current `pde_vec`
+schema.
+
 For CSD3 runs where random ellipse mesh generation is unstable, use
 `--geometry-mode fixed_ellipse`. This keeps one deterministic ellipse geometry
 and varies only the physical/PDE family parameters across simulations:
@@ -293,6 +309,31 @@ Grouped ID/OOD plots from separate evaluation outputs:
 
 When a single `pde_metrics.json` contains `by_family`, the same plotting script
 also creates grouped law-accuracy and mean-R2 plots from that file.
+
+## G. Context-Size Scaling
+
+Context-size scaling evaluates the same checkpoint with different numbers of
+observed frames. This is useful for Report 1 because temporal context is the
+mechanism used for implicit PDE identification.
+
+```powershell
+.\.venv\Scripts\python.exe -m ml.evaluate_context_scaling `
+  --grid datasets\grid_local_smoke `
+  --ckpt checkpoints\local_pde_aux\best_model.pt `
+  --out eval\context_scaling_local_pde_aux `
+  --contexts 2 4 8 16 --device cpu --batch 1
+
+.\.venv\Scripts\python.exe -m ml.plot_report1_metrics `
+  --context-scaling eval\context_scaling_local_pde_aux\context_scaling_metrics.json `
+  --out figures\report1\context_scaling_local_pde_aux
+```
+
+The output JSON records `mse`, `mae`, optional PDE mean R2, optional
+viscosity-law accuracy, and the number of windows for each requested context.
+If a context is too long for the dataset, or if a `learned_absolute` checkpoint
+is asked to exceed its stored `max_context`, that context is skipped with a
+recorded reason instead of crashing. `sinusoidal` checkpoints can be evaluated
+at other context lengths when the trajectory has enough saved frames.
 
 ## Local Windows Smoke Test
 

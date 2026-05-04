@@ -54,6 +54,8 @@ class FamilySpec:
     mesh: Mapping[str, Tuple[float, float]]
     viscosity_laws: Tuple[str, ...] = ("sutherland",)
     power_law_n: Tuple[float, float] = (0.6, 1.0)
+    eos_types: Tuple[str, ...] = ("ideal",)
+    p_inf: Tuple[float, float] = (0.0, 0.0)
 
     def sample_physics(self, rng: np.random.Generator) -> Dict:
         params = {k: float(rng.uniform(*v)) for k, v in self.physical.items()}
@@ -62,6 +64,12 @@ class FamilySpec:
         params["power_law_n"] = (
             float(rng.uniform(*self.power_law_n))
             if law == "power_law" else 0.75
+        )
+        eos_type = str(rng.choice(self.eos_types))
+        params["eos_type"] = eos_type
+        params["p_inf"] = (
+            float(rng.uniform(*self.p_inf))
+            if eos_type == "stiffened_gas" else 0.0
         )
         return params
 
@@ -171,6 +179,7 @@ KEY_STATUS_FIELDS = (
     "fixed_geometry_spec",
     "lnscale", "min_A", "max_A",
     "gamma", "viscosity", "viscosity_law", "power_law_n",
+    "eos_type", "p_inf",
     "visc_bulk", "thermal_cond", "C_v",
     "T_0", "rho_inf", "T_inf", "v_n_inf",
 )
@@ -245,6 +254,8 @@ def _configure_cfg(cfg, params):
     cfg.viscosity = params['viscosity']
     cfg.viscosity_law = params.get('viscosity_law', 'sutherland')
     cfg.power_law_n = params.get('power_law_n', 0.75)
+    cfg.eos_type = params.get('eos_type', 'ideal')
+    cfg.p_inf = params.get('p_inf', 0.0)
     cfg.visc_bulk = params['visc_bulk']
     cfg.thermal_cond = params['thermal_cond']
     cfg.C_v = params['C_v']
@@ -600,6 +611,7 @@ if __name__ == '__main__':
 MANIFEST_PARAM_KEYS = (
     "family", "geometry_mode", "fixed_geometry_spec", "mesh_seed",
     "gamma", "viscosity", "viscosity_law", "power_law_n",
+    "eos_type", "p_inf",
     "visc_bulk", "thermal_cond", "C_v",
     "T_0", "rho_inf", "T_inf", "v_n_inf", "lnscale", "min_A", "max_A",
 )
@@ -644,6 +656,8 @@ def _write_status(out_dir: Path, params: Dict, status: str, *,
         "viscosity": params.get("viscosity"),
         "viscosity_law": params.get("viscosity_law"),
         "power_law_n": params.get("power_law_n"),
+        "eos_type": params.get("eos_type"),
+        "p_inf": params.get("p_inf"),
         "visc_bulk": params.get("visc_bulk"),
         "thermal_cond": params.get("thermal_cond"),
         "C_v": params.get("C_v"),
@@ -779,6 +793,7 @@ def run_one_sim(repo_root: Path, out_dir: Path, params: Dict,
         f"  [{out_dir.name}] {'OK' if success else 'FAIL'} ({elapsed:.1f}s)  "
         f"gamma={params['gamma']:.2f}  mu={params['viscosity']:.2e}  "
         f"law={params.get('viscosity_law', 'sutherland')}  "
+        f"eos={params.get('eos_type', 'ideal')}  "
         f"v={params['v_n_inf']:.1f}"
         + (f"  reason={reason}" if reason and not success else ""),
         flush=True,
@@ -805,6 +820,11 @@ def main() -> None:
                     help="override the selected family's viscosity-law sampling")
     ap.add_argument("--power-law-n", type=float, default=None,
                     help="override the power-law viscosity exponent when viscosity_law=power_law")
+    ap.add_argument("--eos-type", choices=["family", "ideal", "stiffened_gas"],
+                    default="family",
+                    help="override the selected family's equation-of-state sampling")
+    ap.add_argument("--p-inf", type=float, default=None,
+                    help="stiffened-gas pressure offset; default keeps p_inf=0")
     ap.add_argument("--problem", choices=["ellipse", "nozzle"], default="ellipse")
     ap.add_argument("--geometry-mode", choices=["random_ellipse", "fixed_ellipse"],
                     default="random_ellipse",
@@ -862,7 +882,7 @@ def main() -> None:
     print(
         f"Sweep: n={args.n}  family={family.name}  ood_flag={args.ood}  "
         f"problem={args.problem}  geometry_mode={args.geometry_mode}  "
-        f"viscosity_law={args.viscosity_law}",
+        f"viscosity_law={args.viscosity_law}  eos_type={args.eos_type}",
         flush=True,
     )
     print(f"Repo : {repo}\nOut  : {out_root}", flush=True)
@@ -879,6 +899,14 @@ def main() -> None:
                 physics["power_law_n"] = float(args.power_law_n)
         elif args.power_law_n is not None and physics.get("viscosity_law") == "power_law":
             physics["power_law_n"] = float(args.power_law_n)
+        if args.eos_type != "family":
+            physics["eos_type"] = args.eos_type
+            if args.eos_type == "stiffened_gas":
+                physics["p_inf"] = float(args.p_inf) if args.p_inf is not None else 0.0
+            else:
+                physics["p_inf"] = 0.0
+        elif args.p_inf is not None and physics.get("eos_type") == "stiffened_gas":
+            physics["p_inf"] = float(args.p_inf)
         if args.geometry_mode == "fixed_ellipse":
             if args.sample_mesh_params and i == 0:
                 print(
@@ -969,6 +997,8 @@ def main() -> None:
             "sample_mesh_params": args.sample_mesh_params,
             "viscosity_law_override": args.viscosity_law,
             "power_law_n_override": args.power_law_n,
+            "eos_type_override": args.eos_type,
+            "p_inf_override": args.p_inf,
             "geometry_mode": args.geometry_mode,
             "base_mesh": {
                 "lnscale": args.lnscale,

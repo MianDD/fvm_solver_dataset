@@ -46,6 +46,8 @@ class ConfigFVM(ABC):
     S_const: float = None       # Sutherland's constant
     gamma: float = None  # Ratio of specific heats
     C_v: float = None     # Specific heat at constant volume
+    eos_type: str = "ideal"  # {ideal, stiffened_gas}
+    p_inf: float = 0.0       # stiffened-gas pressure offset
 
     # Stability parameters
     v_factor: float = 0.1     # Clamp KT diffusion term to v_factor * c to reduce viscosity.
@@ -118,6 +120,8 @@ class ConfigEllipse(ConfigFVM):
     S_const: float = 110.4       # Sutherland's constant
     gamma: float = 1.2  # Ratio of specific heats
     C_v: float = 2     # Specific heat at constant volume
+    eos_type: str = "ideal"
+    p_inf: float = 0.0
 
     def __post_init__(self):
         self.exit_cfg = EllipseFarfield()
@@ -175,6 +179,8 @@ class ConfigNozzle(ConfigFVM):
     S_const: float = 110.4       # Sutherland's constant
     gamma: float = 1.2  # Ratio of specific heats
     C_v: float = 2     # Specific heat at constant volume
+    eos_type: str = "ideal"
+    p_inf: float = 0.0
 
     def __post_init__(self):
         self.exit_cfg = NozzleFarfield()

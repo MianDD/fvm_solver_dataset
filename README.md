@@ -52,6 +52,7 @@ ml/model.py                Patch Transformer and factorized attention model
 ml/pde.py                  PDE vector schema, normalized loss, metrics helpers
 ml/train.py                Training entry point
 ml/evaluate.py             One-step and rollout evaluation
+ml/evaluate_context_scaling.py Context-length scaling evaluation
 ml/plot_predictions.py     Prediction/error figure generation
 ml/plot_report1_metrics.py Report 1 PDE/rollout metric figures
 ml/smoke_attention.py      Global/factorized attention smoke test
@@ -144,6 +145,9 @@ Important sweep options:
 - `--viscosity-law {family,sutherland,constant,power_law}` optionally overrides
   the family-sampled constitutive law
 - `--power-law-n` sets the exponent for `power_law` viscosity
+- `--eos-type {family,ideal,stiffened_gas}` optionally selects the equation of
+  state; default/family behaviour is still `ideal`
+- `--p-inf` sets the stiffened-gas pressure offset when `--eos-type stiffened_gas`
 - `--max-mesh-retries` and `--mesh-attempt-timeout-s` bound mesh-generation
   failures
 - `--validate-physics` marks bad trajectories as `invalid`
@@ -307,6 +311,13 @@ varying constitutive relations. It is not a full generic PDE registry: the
 solver is still primarily the ideal-gas compressible Navier-Stokes family, with
 scalar parameter variation and initial constitutive-law variation.
 
+An optional `stiffened_gas` EOS prototype is available behind explicit flags.
+The default remains `ideal`, so existing runs are unchanged. The prototype uses
+`p = rho R T - p_inf` and `c = sqrt(gamma (p + p_inf) / rho)` with simple
+floors for numerical safety. EOS metadata is saved in config/status/manifest and
+grid metadata; the current `pde_vec` schema is intentionally left unchanged for
+backward compatibility.
+
 The temporal context window supports implicit PDE identification from observed
 dynamics, but it is not identical to TabPFN-style explicit in-context learning.
 Future technical work should add non-ideal equations of state, non-Newtonian or
@@ -357,6 +368,24 @@ outputs:
   --metrics-list id:eval\id\metrics.json,ood_mild:eval\ood_mild\metrics.json,ood_hard:eval\ood_hard\metrics.json `
   --out figures\report1\grouped
 ```
+
+Evaluate how performance changes with the observed temporal context length:
+
+```powershell
+.\.venv\Scripts\python.exe -m ml.evaluate_context_scaling `
+  --grid datasets\grid_fixed_id20 `
+  --ckpt checkpoints\fixed_id20_factorized\best_model.pt `
+  --out eval\context_scaling_fixed_id20 `
+  --contexts 2 4 8 16 --device cpu --batch 4
+
+.\.venv\Scripts\python.exe -m ml.plot_report1_metrics `
+  --context-scaling eval\context_scaling_fixed_id20\context_scaling_metrics.json `
+  --out figures\report1\context_scaling_fixed_id20
+```
+
+`learned_absolute` checkpoints skip contexts larger than their stored
+`max_context`; `sinusoidal` checkpoints can be evaluated at other context
+lengths when enough frames exist.
 
 ## CSD3 Scripts
 
@@ -414,10 +443,14 @@ sbatch scripts/csd3_plot_id200_factorized.slurm
 Useful checks before a longer run:
 
 ```powershell
-.\.venv\Scripts\python.exe -m compileall ml sweep
+.\.venv\Scripts\python.exe -m compileall ml sweep time_fvm
 .\.venv\Scripts\python.exe -m sweep.sweep_fvm --help
 .\.venv\Scripts\python.exe -m ml.train --help
+.\.venv\Scripts\python.exe -m ml.evaluate --help
+.\.venv\Scripts\python.exe -m ml.evaluate_context_scaling --help
+.\.venv\Scripts\python.exe -m ml.plot_report1_metrics --help
 .\.venv\Scripts\python.exe -m ml.smoke_attention
+.\.venv\Scripts\python.exe -m ml.smoke_report1
 ```
 
 For the complete workflow with more explanation, see

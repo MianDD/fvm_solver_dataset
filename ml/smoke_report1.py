@@ -16,6 +16,7 @@ import torch
 
 from .dataset import CFDWindowDataset
 from .evaluate import evaluate
+from .evaluate_context_scaling import evaluate_context_scaling
 from .model import FoundationCFDModel
 from .pde import (
     BASE_PDE_NAMES,
@@ -266,6 +267,21 @@ def main() -> None:
         pde_json = root / "eval" / "pde_metrics.json"
         if not pde_json.exists():
             raise RuntimeError("synthetic evaluation did not write pde_metrics.json")
+        scaling = evaluate_context_scaling(
+            grid13,
+            ckpt_path,
+            root / "context_scaling",
+            contexts=[2, 3, 8],
+            batch_size=1,
+            device="cpu",
+            rollout_steps="",
+        )
+        if scaling["results"]["2"].get("status") != "success":
+            raise RuntimeError("context=2 scaling evaluation did not succeed")
+        if scaling["results"]["8"].get("status") != "skipped":
+            raise RuntimeError("too-long synthetic context was not skipped")
+        if not (root / "context_scaling" / "context_scaling_metrics.json").exists():
+            raise RuntimeError("context scaling metrics JSON was not written")
         print(
             "OK synthetic report1 smoke: "
             f"windows={len(ds)} C_in={x.shape[2]} pred_loss={float(pred_loss.detach()):.4e} "

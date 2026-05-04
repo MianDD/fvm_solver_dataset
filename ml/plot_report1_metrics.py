@@ -253,9 +253,54 @@ def _plot_grouped(records: List[Dict], out_dir: Path) -> None:
     )
 
 
+def _context_pairs(payload: Dict, key: str) -> List[Tuple[int, float]]:
+    pairs: List[Tuple[int, float]] = []
+    for context_text, result in payload.get("results", {}).items():
+        if result.get("status") != "success":
+            continue
+        value = result.get(key)
+        if value is None:
+            continue
+        pairs.append((int(context_text), float(value)))
+    return sorted(pairs)
+
+
+def _plot_context_scaling(payload: Dict, out_dir: Path) -> None:
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:  # pragma: no cover
+        print(f"Skipping context-scaling plots: matplotlib unavailable ({exc})")
+        return
+
+    specs = [
+        ("mse", "context_scaling_mse.png", "one-step MSE", "Context scaling: prediction MSE"),
+        ("pde_mean_r2", "context_scaling_pde_r2.png", "mean PDE R^2", "Context scaling: PDE R^2"),
+        ("pde_law_accuracy", "context_scaling_law_accuracy.png", "law accuracy", "Context scaling: viscosity-law accuracy"),
+    ]
+    for key, filename, ylabel, title in specs:
+        pairs = _context_pairs(payload, key)
+        if not pairs:
+            print(f"Skipping {filename}: no successful context entries with {key}.")
+            continue
+        xs = [p[0] for p in pairs]
+        ys = [p[1] for p in pairs]
+        fig, ax = plt.subplots(figsize=(5.4, 3.4))
+        ax.plot(xs, ys, marker="o")
+        ax.set_xlabel("context length")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.set_xticks(xs)
+        fig.tight_layout()
+        fig.savefig(out_dir / filename, dpi=180)
+        plt.close(fig)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--metrics", help="metrics.json or pde_metrics.json from ml.evaluate")
+    ap.add_argument("--context-scaling", help="context_scaling_metrics.json from ml.evaluate_context_scaling")
     ap.add_argument(
         "--metrics-list",
         default=None,
@@ -268,6 +313,8 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     if args.metrics_list:
         _plot_grouped(_grouped_records_from_metrics_list(args.metrics_list), out_dir)
+    if args.context_scaling:
+        _plot_context_scaling(_load_metrics(args.context_scaling), out_dir)
     if args.metrics:
         metrics = _load_metrics(args.metrics)
         pde = _pde_section(metrics)
@@ -278,8 +325,8 @@ def main() -> None:
             _plot_confusion(pde, out_dir)
             _plot_grouped(_grouped_records_from_by_family(pde), out_dir)
         _plot_rollout(metrics, out_dir)
-    if not args.metrics and not args.metrics_list:
-        raise SystemExit("ERROR: provide --metrics, --metrics-list, or both")
+    if not args.metrics and not args.metrics_list and not args.context_scaling:
+        raise SystemExit("ERROR: provide --metrics, --metrics-list, --context-scaling, or a combination")
     print(f"Wrote Report 1 figures to {out_dir}")
 
 

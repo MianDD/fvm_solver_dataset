@@ -20,7 +20,7 @@ CHANNEL_NAMES = ["V_x", "V_y", "rho", "T"]
 PHYSICAL_KEYS = [
     "gamma", "viscosity", "visc_bulk", "thermal_cond", "C_v",
     "T_0", "rho_inf", "T_inf", "v_n_inf",
-    "viscosity_law", "power_law_n",
+    "viscosity_law", "power_law_n", "eos_type", "p_inf",
 ]
 VISCOSITY_LAWS = list(VISCOSITY_LAW_NAMES)
 MESH_KEYS = ["lnscale", "min_A", "max_A", "mesh_seed"]

@@ -30,8 +30,12 @@ class PhysicalSetup:
         self.C_v = cfg.C_v
         self.gamma = cfg.gamma
         self.R = self.C_v * (cfg.gamma - 1)
+        self.eos_type = getattr(cfg, "eos_type", "ideal")
+        self.p_inf = float(getattr(cfg, "p_inf", 0.0))
         if self.viscosity_law not in {"sutherland", "constant", "power_law"}:
             raise ValueError(f"Unknown viscosity_law={self.viscosity_law!r}")
+        if self.eos_type not in {"ideal", "stiffened_gas"}:
+            raise ValueError(f"Unknown eos_type={self.eos_type!r}")
 
     def state_to_primative(self, state: torch.Tensor):
         """ Convert from conserved quantities (momentum, rho, energy) to primitives (velocity, rho, T) """
@@ -110,18 +114,28 @@ class PhysicalSetup:
     # General gas parameters.
     def eos_c(self, rho, T):
         """ Speed of sound, c^2 = dp/drho | s"""
+        if self.eos_type == "stiffened_gas":
+            P = self.eos_P(rho, T)
+            rho_safe = rho.clamp_min(1e-12)
+            return torch.sqrt((self.gamma * (P + self.p_inf).clamp_min(1e-12) / rho_safe).clamp_min(1e-12))
         return torch.sqrt(self.gamma * self.R * T)
 
     def eos_P(self, rho, T):
         """ Pressure EOS """
+        if self.eos_type == "stiffened_gas":
+            return self.R * rho * T - self.p_inf
         return self.R * rho * T
 
     def eos_T(self, rho, P):
         """ Inverse of eos_P """
+        if self.eos_type == "stiffened_gas":
+            return (P + self.p_inf) / (self.R * rho)
         return P / (self.R * rho)
 
     def eos_rho(self, P, T):
         """ Inverse of eos_P """
+        if self.eos_type == "stiffened_gas":
+            return (P + self.p_inf) / (self.R * T)
         return P / (self.R * T)
 
     def update(self, E_props: FVMEdgeInfo):
