@@ -61,11 +61,22 @@ def _check(attention_type: str) -> FoundationCFDModel:
     model = _make_model(attention_type)
     x = torch.randn(B, CONTEXT, C_IN, H, W)
     update_sequence = model.predict_update(x)
+    expected_sequence = (B, 1, C_OUT, H, W)
+    if tuple(update_sequence.shape) != expected_sequence:
+        raise RuntimeError(
+            f"{attention_type}: expected one-step decoded update shape "
+            f"{expected_sequence}, got {tuple(update_sequence.shape)}"
+        )
     update = update_sequence[:, -1]
     expected = (B, C_OUT, H, W)
     if tuple(update.shape) != expected:
         raise RuntimeError(
             f"{attention_type}: expected output shape {expected}, got {tuple(update.shape)}"
+        )
+    pred = model(x)
+    if tuple(pred.shape) != expected_sequence:
+        raise RuntimeError(
+            f"{attention_type}: expected forward output shape {expected_sequence}, got {tuple(pred.shape)}"
         )
     loss = update.square().mean()
     loss.backward()
@@ -79,7 +90,8 @@ def _check(attention_type: str) -> FoundationCFDModel:
     print(
         f"  {attention_type}: params={count_params(model):,} "
         f"sequence_shape={tuple(update_sequence.shape)} "
-        f"final_output_shape={tuple(update.shape)} loss={float(loss.detach()):.4e}"
+        f"final_output_shape={tuple(update.shape)} "
+        f"forward_shape={tuple(pred.shape)} loss={float(loss.detach()):.4e}"
     )
     return model
 

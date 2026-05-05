@@ -122,20 +122,58 @@ def _configured_input_channel_names(cfg: TrainConfig) -> List[str]:
     return input_channel_names(cfg.use_derivatives, cfg.use_mask_channel, TARGET_CHANNEL_NAMES)
 
 
-def compute_channel_stats(loader: DataLoader, n_channels: int) -> Tuple[torch.Tensor, torch.Tensor]:
+def compute_channel_stats(loader: DataLoader, n_channels: int,
+                          use_fluid_mask: bool = False,
+                          mask_channel_index: int | None = None
+                          ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute input-channel statistics, optionally over fluid cells only.
+
+    When gridded files include a binary fluid mask, all non-mask input channels
+    are normalised from mask==1 cells only.  This keeps neutral obstacle values
+    out of physical and derivative-feature statistics.  The optional static
+    mask channel is intentionally left raw by forcing mean=0 and std=1.
+    """
     sums = torch.zeros(n_channels)
     sums2 = torch.zeros(n_channels)
-    n = 0
+    counts = torch.zeros(n_channels)
+    mask_idx = None if mask_channel_index is None else int(mask_channel_index)
+    if mask_idx is not None and not (0 <= mask_idx < n_channels):
+        raise ValueError(f"mask_channel_index={mask_idx} outside n_channels={n_channels}")
     with torch.no_grad():
         for batch in loader:
             x = batch["input_states"]                    # (B, context, C_in, H, W)
             _, _, C, H, W = x.shape
-            xx = x.reshape(-1, C, H * W)
-            sums += xx.sum(dim=(0, 2))
-            sums2 += (xx ** 2).sum(dim=(0, 2))
-            n += xx.shape[0] * xx.shape[2]
-    mean = sums / max(n, 1)
-    var = (sums2 / max(n, 1) - mean ** 2).clamp_min(1e-6)
+            if C != n_channels:
+                raise ValueError(f"expected {n_channels} input channels, got {C}")
+            if use_fluid_mask:
+                mask = batch["mask"].to(dtype=x.dtype)    # (B, H, W)
+                if mask.dim() == 4 and mask.shape[1] == 1:
+                    mask = mask[:, 0]
+                if mask.shape != (x.shape[0], H, W):
+                    raise ValueError(f"mask shape {tuple(mask.shape)} does not match batch grid {(x.shape[0], H, W)}")
+                weights = mask[:, None, None, :, :].expand(-1, x.shape[1], 1, -1, -1)
+                for ch in range(C):
+                    if ch == mask_idx:
+                        continue
+                    values = x[:, :, ch:ch + 1, :, :]
+                    sums[ch] += (values * weights).sum()
+                    sums2[ch] += ((values ** 2) * weights).sum()
+                    counts[ch] += weights.sum()
+            else:
+                xx = x.reshape(-1, C, H * W)
+                sums += xx.sum(dim=(0, 2))
+                sums2 += (xx ** 2).sum(dim=(0, 2))
+                counts += xx.shape[0] * xx.shape[2]
+    if mask_idx is not None:
+        sums[mask_idx] = 0.0
+        sums2[mask_idx] = 0.0
+        counts[mask_idx] = 1.0
+    safe_counts = counts.clamp_min(1.0)
+    mean = sums / safe_counts
+    var = (sums2 / safe_counts - mean ** 2).clamp_min(1e-6)
+    if mask_idx is not None:
+        mean[mask_idx] = 0.0
+        var[mask_idx] = 1.0
     return mean, var.sqrt()
 
 
@@ -318,6 +356,12 @@ def save_checkpoint(path: Path, model: FoundationCFDModel, optim, sched,
             "channel_names": model_config["input_channel_names"],
             "mean": model.normaliser.mean.detach().cpu().tolist(),
             "std": model.normaliser.std.detach().cpu().tolist(),
+            "masked_channel_stats": bool(model_config.get("masked_channel_stats", False)),
+            "mask_channel_raw": bool(model_config.get("mask_channel_raw", False)),
+            "mask_channel_index": (
+                model_config["n_input_channels"] - 1
+                if model_config.get("mask_channel_raw", False) else None
+            ),
         },
         "pde_schema": model_config.get("pde_schema", {}),
         "pde_normalizer": model_config.get("pde_normalizer"),
@@ -607,6 +651,8 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
     model_cfg["pde_schema"] = pde_schema
     model_cfg["pde_normalizer"] = pde_normalizer
     model_cfg["pde_class_counts"] = pde_class_counts
+    model_cfg["masked_channel_stats"] = bool(train_ds.has_masks)
+    model_cfg["mask_channel_raw"] = bool(cfg.use_mask_channel)
     save_json(out_dir / "model_config.json", model_cfg)
     if cfg.pde_aux_loss:
         save_json(out_dir / "pde_normalizer.json", {
@@ -624,7 +670,13 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         })
     print(f"Model params: {count_params(model):,}")
 
-    mean, std = compute_channel_stats(train_loader, C_in)
+    mask_channel_index = C_in - 1 if cfg.use_mask_channel else None
+    mean, std = compute_channel_stats(
+        train_loader,
+        C_in,
+        use_fluid_mask=bool(train_ds.has_masks),
+        mask_channel_index=mask_channel_index,
+    )
     model.normaliser.mean.copy_(mean.to(device))
     model.normaliser.std.copy_(std.to(device))
     model.normaliser._initialised = True
@@ -632,8 +684,17 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         "channel_names": model_cfg["input_channel_names"],
         "mean": mean.tolist(),
         "std": std.tolist(),
+        "masked_channel_stats": bool(train_ds.has_masks),
+        "mask_channel_raw": bool(cfg.use_mask_channel),
+        "mask_channel_index": mask_channel_index,
     }
     save_json(out_dir / "normalizer.json", normalizer)
+    if train_ds.has_masks:
+        print("  channel stats: using fluid-mask cells only for non-mask input channels")
+    else:
+        print("  channel stats: no saved masks found; using all grid cells")
+    if cfg.use_mask_channel:
+        print("  mask channel normalisation: raw binary channel (mean=0, std=1)")
     print(f"  input means: {mean.numpy().round(3)}")
     print(f"  input stds : {std.numpy().round(3)}")
 
@@ -898,6 +959,8 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         "use_derivatives": cfg.use_derivatives,
         "use_mask_channel": cfg.use_mask_channel,
         "mask_loss": cfg.mask_loss,
+        "masked_channel_stats": bool(train_ds.has_masks),
+        "mask_channel_raw": bool(cfg.use_mask_channel),
         "use_physical_derivatives": cfg.use_physical_derivatives,
         "physical_derivative_spacing": model_cfg["physical_derivative_spacing"],
         "attention_type": cfg.attention_type,

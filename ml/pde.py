@@ -27,7 +27,9 @@ OLD_13D_PDE_VEC_NAMES = BASE_PDE_NAMES + VISCOSITY_LAW_VEC_NAMES + [POWER_LAW_N_
 EOS_TYPE_NAMES = ["ideal", "stiffened_gas"]
 EOS_TYPE_VEC_NAMES = [f"eos_type_{name}" for name in EOS_TYPE_NAMES]
 P_INF_NAME = "p_inf"
-DEFAULT_PDE_VEC_NAMES = OLD_13D_PDE_VEC_NAMES + EOS_TYPE_VEC_NAMES + [P_INF_NAME]
+OLD_16D_PDE_VEC_NAMES = OLD_13D_PDE_VEC_NAMES + EOS_TYPE_VEC_NAMES + [P_INF_NAME]
+P_INF_RATIO_NAME = "p_inf_ratio"
+DEFAULT_PDE_VEC_NAMES = OLD_16D_PDE_VEC_NAMES + [P_INF_RATIO_NAME]
 DEFAULT_LOG_PDE_NAMES = ["viscosity", "visc_bulk", "thermal_cond"]
 DEFAULT_LOG_INDICES = [1, 2, 3]
 DEFAULT_ACTIVE_STD_THRESHOLD = 1e-4
@@ -38,6 +40,8 @@ def default_pde_names(dim: int) -> List[str]:
     dim = int(dim)
     if dim == len(DEFAULT_PDE_VEC_NAMES):
         return list(DEFAULT_PDE_VEC_NAMES)
+    if dim == len(OLD_16D_PDE_VEC_NAMES):
+        return list(OLD_16D_PDE_VEC_NAMES)
     if dim == len(OLD_13D_PDE_VEC_NAMES):
         return list(OLD_13D_PDE_VEC_NAMES)
     if dim == len(BASE_PDE_NAMES):
@@ -49,9 +53,9 @@ def infer_pde_schema(names: Sequence[str] | None = None,
                      pde_dim: int | None = None) -> Dict:
     """Infer continuous and categorical slices from pde_vec names.
 
-    The current 16D layout is the previous 13D layout plus two EOS one-hot
-    entries and ``p_inf``.  The old 9D and 13D layouts are inferred explicitly
-    so older datasets and checkpoints remain usable.
+    The current 17D layout is the previous 16D layout plus ``p_inf_ratio``.
+    The old 9D, 13D, and 16D layouts are inferred explicitly so older datasets
+    and checkpoints remain usable.
     """
     if names:
         vec_names = [str(name) for name in names]
@@ -73,6 +77,7 @@ def infer_pde_schema(names: Sequence[str] | None = None,
     continuous_indices = [i for i in range(dim) if i not in categorical_index_set]
     power_law_n_index = vec_names.index(POWER_LAW_N_NAME) if POWER_LAW_N_NAME in vec_names else None
     p_inf_index = vec_names.index(P_INF_NAME) if P_INF_NAME in vec_names else None
+    p_inf_ratio_index = vec_names.index(P_INF_RATIO_NAME) if P_INF_RATIO_NAME in vec_names else None
     return {
         "pde_vec_names": vec_names,
         "pde_dim": dim,
@@ -86,6 +91,7 @@ def infer_pde_schema(names: Sequence[str] | None = None,
         "eos_type_names": list(EOS_TYPE_NAMES) if eos_indices else [],
         "has_eos_type": bool(eos_indices),
         "p_inf_index": p_inf_index,
+        "p_inf_ratio_index": p_inf_ratio_index,
     }
 
 
@@ -319,6 +325,17 @@ def pde_loss_components(pred: torch.Tensor,
             )
             if stiffened_mask is not None:
                 col = cont_indices.index(int(p_inf_index))
+                valid_mask[:, col] &= stiffened_mask
+        p_inf_ratio_index = schema.get("p_inf_ratio_index")
+        if p_inf_ratio_index in cont_indices:
+            stiffened_mask = _class_mask(
+                true,
+                schema.get("eos_type_indices", []),
+                schema.get("eos_type_names", []),
+                "stiffened_gas",
+            )
+            if stiffened_mask is not None:
+                col = cont_indices.index(int(p_inf_ratio_index))
                 valid_mask[:, col] &= stiffened_mask
 
         residual = pred_cont - true_cont

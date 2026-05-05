@@ -406,9 +406,9 @@ class FoundationCFDModel(nn.Module):
         tokens_structured = self.encode_context_tokens(states_n)  # (B, T, N, D)
         n_patches = tokens_structured.shape[2]
         if self.attention_type == "global":
-            # Legacy baseline path: flatten time and space into one block-causal
-            # sequence, then decode all T context steps for checkpoint/repro
-            # compatibility. Downstream code selects the final slice with [:, -1].
+            # Baseline path: flatten time and space into one block-causal
+            # sequence. Decoding happens later from the final context-step
+            # tokens only, matching the one-step factorized path.
             tokens = tokens_structured.reshape(B, tau * n_patches, self.d_model)
             mask = self._block_causal_mask(tau, n_patches, tokens.device)
             out = self.transformer(tokens, mask=mask)
@@ -424,17 +424,13 @@ class FoundationCFDModel(nn.Module):
         """Return predicted update fields and optional PDE-parameter logits.
 
         The update interpretation is chosen by the caller via
-        ``prediction_mode``. Global attention preserves the legacy update shape
-        ``(B, T, C, H, W)`` by decoding every context step. Factorized attention
-        decodes only the final context step and returns ``(B, 1, C, H, W)``.
+        ``prediction_mode``. Both global and factorized attention decode only
+        the final context-step spatial tokens and return ``(B, 1, C, H, W)``.
         """
         out, B, tau, H, W, _, n_patches = self._encoded_tokens(states, normalised=normalised)
-        if self.attention_type == "global":
-            flat = out.reshape(B * tau, n_patches, self.d_model)
-            out_tau = tau
-        else:
-            flat = out[:, -1].reshape(B, n_patches, self.d_model)
-            out_tau = 1
+        # Future Report 2 extension: all-token next-step supervision.
+        flat = out[:, -1].reshape(B, n_patches, self.d_model)
+        out_tau = 1
         patches = self.patch_decoder(flat)
         delta = from_patches(patches, self.C, H, W, self.P)
         delta = delta + self.refine(delta)

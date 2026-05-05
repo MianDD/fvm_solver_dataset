@@ -17,6 +17,7 @@ class PhysicalSetup:
     tau: torch.Tensor       # shape = [n_edges, 2, 2]
     P_face: torch.Tensor    # shape = [n_edges, 2, 1]
     c: torch.Tensor         # shape = [n_edges, 2, 1]
+    EOS_VERSION = "stiffened_gas_gamma_pinf_v1"
 
     def __init__(self, cfg: ConfigFVM):
         self.device = cfg.device
@@ -32,6 +33,7 @@ class PhysicalSetup:
         self.R = self.C_v * (cfg.gamma - 1)
         self.eos_type = getattr(cfg, "eos_type", "ideal")
         self.p_inf = float(getattr(cfg, "p_inf", 0.0))
+        self.eos_version = getattr(cfg, "eos_version", self.EOS_VERSION)
         if self.viscosity_law not in {"sutherland", "constant", "power_law"}:
             raise ValueError(f"Unknown viscosity_law={self.viscosity_law!r}")
         if self.eos_type not in {"ideal", "stiffened_gas"}:
@@ -69,20 +71,42 @@ class PhysicalSetup:
         I1 = I1.view(-1, 1, 1)   # [n_edges, 1, 1]. Trace of D.
 
         mu = self.shear_viscosity(T)  # shape = [n_edges, edges=2, n_comp=1]
-        # Bulk viscosity: Proportional to T^2
-        mu_b = self.mu_b * T ** 2 / self.T_0 ** 2
+        mu_b = self.bulk_viscosity(T)
 
         eye = torch.eye(2, device=self.device)
         self.tau = -2 * mu * D - mu_b * I1 * eye  # shape = [n_edges, 2, 2]
 
+    def _safe_temperature(self, T: torch.Tensor) -> torch.Tensor:
+        return T.clamp_min(1e-12)
+
+    def _sutherland_scale(self, T: torch.Tensor) -> torch.Tensor:
+        T_safe = self._safe_temperature(T)
+        T0_safe = max(float(self.T_0), 1e-12)
+        denom = (T_safe + float(self.S_const)).clamp_min(1e-12)
+        return (T_safe / T0_safe) ** 1.5 * (float(self.T_0) + float(self.S_const)) / denom
+
     def shear_viscosity(self, T: torch.Tensor) -> torch.Tensor:
         """Dynamic shear viscosity for the selected constitutive law."""
+        T_safe = self._safe_temperature(T)
+        T0_safe = max(float(self.T_0), 1e-12)
         if self.viscosity_law == "sutherland":
-            return self.mu * (T / self.T_0) ** 1.5 * (self.T_0 + self.S_const) / (T + self.S_const)
+            return (self.mu * self._sutherland_scale(T_safe)).clamp_min(0.0)
         if self.viscosity_law == "constant":
-            return torch.ones_like(T) * self.mu
+            return torch.ones_like(T_safe) * max(float(self.mu), 0.0)
         if self.viscosity_law == "power_law":
-            return self.mu * (T / self.T_0) ** self.power_law_n
+            return (self.mu * (T_safe / T0_safe) ** self.power_law_n).clamp_min(0.0)
+        raise ValueError(f"Unknown viscosity_law={self.viscosity_law!r}")
+
+    def bulk_viscosity(self, T: torch.Tensor) -> torch.Tensor:
+        """Dynamic bulk viscosity matched to the selected shear-viscosity law."""
+        T_safe = self._safe_temperature(T)
+        T0_safe = max(float(self.T_0), 1e-12)
+        if self.viscosity_law == "sutherland":
+            return (self.mu_b * self._sutherland_scale(T_safe)).clamp_min(0.0)
+        if self.viscosity_law == "constant":
+            return torch.ones_like(T_safe) * max(float(self.mu_b), 0.0)
+        if self.viscosity_law == "power_law":
+            return (self.mu_b * (T_safe / T0_safe) ** self.power_law_n).clamp_min(0.0)
         raise ValueError(f"Unknown viscosity_law={self.viscosity_law!r}")
 
     def _strain_values(self, E_props: FVMEdgeInfo):
@@ -114,29 +138,33 @@ class PhysicalSetup:
     # General gas parameters.
     def eos_c(self, rho, T):
         """ Speed of sound, c^2 = dp/drho | s"""
+        rho_safe = rho.clamp_min(1e-12)
+        T_safe = T.clamp_min(1e-12)
         if self.eos_type == "stiffened_gas":
-            P = self.eos_P(rho, T)
-            rho_safe = rho.clamp_min(1e-12)
-            return torch.sqrt((self.gamma * (P + self.p_inf).clamp_min(1e-12) / rho_safe).clamp_min(1e-12))
-        return torch.sqrt(self.gamma * self.R * T)
+            P = self.eos_P(rho_safe, T_safe)
+            c2 = self.gamma * (P + self.p_inf).clamp_min(1e-12) / rho_safe
+            return torch.sqrt(c2.clamp_min(1e-12))
+        return torch.sqrt((self.gamma * self.R * T_safe).clamp_min(1e-12))
 
     def eos_P(self, rho, T):
         """ Pressure EOS """
         if self.eos_type == "stiffened_gas":
-            return self.R * rho * T - self.p_inf
+            return self.R * rho * T - self.gamma * self.p_inf
         return self.R * rho * T
 
     def eos_T(self, rho, P):
         """ Inverse of eos_P """
+        rho_safe = rho.clamp_min(1e-12)
         if self.eos_type == "stiffened_gas":
-            return (P + self.p_inf) / (self.R * rho)
-        return P / (self.R * rho)
+            return ((P + self.gamma * self.p_inf) / (self.R * rho_safe)).clamp_min(1e-12)
+        return (P / (self.R * rho_safe)).clamp_min(1e-12)
 
     def eos_rho(self, P, T):
         """ Inverse of eos_P """
+        T_safe = T.clamp_min(1e-12)
         if self.eos_type == "stiffened_gas":
-            return (P + self.p_inf) / (self.R * T)
-        return P / (self.R * T)
+            return ((P + self.gamma * self.p_inf) / (self.R * T_safe)).clamp_min(1e-12)
+        return (P / (self.R * T_safe)).clamp_min(1e-12)
 
     def update(self, E_props: FVMEdgeInfo):
         # E_props = self.E_props
@@ -429,7 +457,7 @@ class FVMEquation:
         Vx, Vy, rho, T = primatives[:, 0], primatives[:, 1], primatives[:, 2], primatives[:, 3]
 
         P = self.phy_setup.eos_P(rho, T)
-        c = torch.sqrt(P / rho)
+        c = self.phy_setup.eos_c(rho, T)
 
         Mx, My = Vx / c, Vy / c
         M_num = torch.sqrt(Mx ** 2 + My ** 2)

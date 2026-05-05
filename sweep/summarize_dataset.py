@@ -15,9 +15,11 @@ from typing import Dict, Iterable, List
 
 
 PARAM_KEYS = [
-    "gamma", "viscosity", "visc_bulk", "thermal_cond", "C_v",
+    "gamma", "viscosity", "visc_bulk", "thermal_cond", "S_const", "C_v",
     "T_0", "rho_inf", "T_inf", "v_n_inf", "lnscale", "min_A", "max_A",
+    "power_law_n", "p_inf", "p_inf_ratio",
 ]
+CATEGORICAL_KEYS = ["family", "viscosity_law", "eos_type", "eos_version"]
 
 
 def _snapshot_count(sim_dir: Path) -> int:
@@ -47,6 +49,7 @@ def _legacy_status(sim_dir: Path) -> Dict:
         "reason": reason,
         "number_of_snapshots_saved": snapshots,
         **{k: cfg.get(k) for k in PARAM_KEYS if k in cfg},
+        **{k: cfg.get(k) for k in CATEGORICAL_KEYS if k in cfg},
     }
 
 
@@ -79,6 +82,7 @@ def summarize(sweep_dir: str | Path) -> Dict:
     counts = Counter(row.get("status", "unknown") for row in rows)
     reasons = Counter()
     params = defaultdict(list)
+    categories = {key: Counter() for key in CATEGORICAL_KEYS}
     snapshots = []
     for row in rows:
         status = row.get("status", "unknown")
@@ -90,6 +94,9 @@ def summarize(sweep_dir: str | Path) -> Dict:
         for key in PARAM_KEYS:
             if row.get(key) is not None:
                 params[key].append(row[key])
+        for key in CATEGORICAL_KEYS:
+            if row.get(key) is not None:
+                categories[key][str(row[key])] += 1
 
     return {
         "sweep_dir": str(sweep_dir),
@@ -101,6 +108,7 @@ def summarize(sweep_dir: str | Path) -> Dict:
         "status_counts": dict(counts),
         "snapshot_count": _numeric_summary(snapshots),
         "parameter_summary": {k: _numeric_summary(v) for k, v in params.items()},
+        "categorical_summary": {k: dict(v) for k, v in categories.items() if v},
         "common_failure_reasons": dict(reasons.most_common(10)),
         "ready_for_grid_adapter": counts.get("success", 0) > 0,
     }
@@ -129,6 +137,11 @@ def print_summary(summary: Dict) -> None:
                 f"  {key}: min={stats['min']:.4g} "
                 f"mean={stats['mean']:.4g} max={stats['max']:.4g}"
             )
+    if summary.get("categorical_summary"):
+        print("Categorical counts:")
+        for key, counts in summary["categorical_summary"].items():
+            joined = ", ".join(f"{name}={count}" for name, count in sorted(counts.items()))
+            print(f"  {key}: {joined}")
     if summary["common_failure_reasons"]:
         print("Common failure/invalid reasons:")
         for reason, count in summary["common_failure_reasons"].items():

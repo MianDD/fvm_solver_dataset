@@ -20,7 +20,7 @@ CHANNEL_NAMES = ["V_x", "V_y", "rho", "T"]
 PHYSICAL_KEYS = [
     "gamma", "viscosity", "visc_bulk", "thermal_cond", "C_v",
     "T_0", "rho_inf", "T_inf", "v_n_inf",
-    "viscosity_law", "power_law_n", "eos_type", "p_inf",
+    "viscosity_law", "power_law_n", "eos_type", "p_inf", "p_inf_ratio",
 ]
 VISCOSITY_LAWS = list(VISCOSITY_LAW_NAMES)
 EOS_TYPES = list(EOS_TYPE_NAMES)
@@ -162,7 +162,9 @@ def _read_json(path: Path) -> Dict[str, Any]:
 
 
 def _metadata(sim_dir: Path, cfg: Dict[str, Any], status: Dict[str, Any],
-              times: np.ndarray, interp: GridInterpolator) -> Dict[str, Any]:
+              times: np.ndarray, interp: GridInterpolator,
+              mask: np.ndarray,
+              neutral_values: np.ndarray | None = None) -> Dict[str, Any]:
     """Build portable metadata for the packed grid file."""
     physical = {k: status.get(k, cfg.get(k)) for k in PHYSICAL_KEYS}
     mesh = {k: status.get(k, cfg.get(k)) for k in MESH_KEYS}
@@ -187,6 +189,17 @@ def _metadata(sim_dir: Path, cfg: Dict[str, Any], status: Dict[str, Any],
             "0": "solid_or_invalid",
             "1": "fluid",
         },
+        "solid_neutralization": {
+            "applied": True,
+            "state_convention": "primitive",
+            "channel_names": CHANNEL_NAMES,
+            "mask_value_neutralized": 0,
+            "neutral_values": (
+                [float(v) for v in neutral_values.tolist()]
+                if neutral_values is not None else None
+            ),
+            "nonfluid_pixels": int(np.sum(np.asarray(mask) <= 0.5)),
+        },
         "grid_shape": [int(interp.H), int(interp.W)],
         "grid": {
             "bbox": [float(v) for v in interp.bbox],
@@ -199,6 +212,84 @@ def _metadata(sim_dir: Path, cfg: Dict[str, Any], status: Dict[str, Any],
         },
         "source_dir": str(sim_dir),
     }
+
+
+def _positive_from_metadata(*sources: Dict[str, Any],
+                            keys: Tuple[str, ...],
+                            default: float | None = None) -> float | None:
+    for source in sources:
+        for key in keys:
+            try:
+                value = float(source.get(key))
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(value) and value > 0.0:
+                return value
+    return default
+
+
+def _positive_fluid_median(snaps: np.ndarray, mask: np.ndarray,
+                           channel: int, default: float) -> float:
+    fluid = np.asarray(mask) > 0.5
+    if np.any(fluid):
+        values = np.asarray(snaps[:, channel, :, :], dtype=np.float32)[:, fluid]
+        values = values[np.isfinite(values) & (values > 0.0)]
+        if values.size:
+            median = float(np.median(values))
+            if np.isfinite(median) and median > 0.0:
+                return median
+    return float(default)
+
+
+def neutral_primitive_values(cfg: Dict[str, Any], status: Dict[str, Any],
+                             snaps: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Return neutral primitive values [V_x, V_y, rho, T] for non-fluid cells."""
+    rho_ref = _positive_from_metadata(
+        status,
+        cfg,
+        keys=("rho_inf",),
+    )
+    T_ref = _positive_from_metadata(
+        status,
+        cfg,
+        keys=("T_inf", "T_0"),
+    )
+    if rho_ref is None:
+        rho_ref = _positive_fluid_median(snaps, mask, channel=2, default=1.0)
+    if T_ref is None:
+        T_ref = _positive_fluid_median(snaps, mask, channel=3, default=1.0)
+    return np.array([0.0, 0.0, rho_ref, T_ref], dtype=np.float32)
+
+
+def neutralize_nonfluid_primitives(snaps: np.ndarray, mask: np.ndarray,
+                                   cfg: Dict[str, Any] | None = None,
+                                   status: Dict[str, Any] | None = None
+                                   ) -> Tuple[np.ndarray, np.ndarray]:
+    """Replace mask==0 primitive values with neutral physical values.
+
+    ``snaps`` uses the grid adapter's primitive state convention
+    ``[V_x, V_y, rho, T]``.  Interpolation can fill obstacle holes with
+    plausible-looking fluid values; this function prevents those values from
+    being saved as targets by setting non-fluid cells to zero velocity and
+    freestream/reference density and temperature.
+    """
+    snaps = np.asarray(snaps, dtype=np.float32)
+    if snaps.ndim != 4 or snaps.shape[1] != len(CHANNEL_NAMES):
+        raise ValueError(
+            f"expected snaps with shape (T, {len(CHANNEL_NAMES)}, H, W), got {snaps.shape}"
+        )
+    mask_arr = np.asarray(mask, dtype=np.float32)
+    if mask_arr.shape != snaps.shape[-2:]:
+        raise ValueError(f"mask shape {mask_arr.shape} does not match states grid {snaps.shape[-2:]}")
+    cfg = cfg or {}
+    status = status or {}
+    neutral = neutral_primitive_values(cfg, status, snaps, mask_arr)
+    out = snaps.copy()
+    nonfluid = mask_arr <= 0.5
+    if np.any(nonfluid):
+        for channel, value in enumerate(neutral):
+            out[:, channel, nonfluid] = float(value)
+    return out.astype(np.float32), neutral
 
 
 def convert_one_sim(sim_dir: Path, grid_H: int = 64, grid_W: int = 96
@@ -233,8 +324,10 @@ def convert_one_sim(sim_dir: Path, grid_H: int = 64, grid_W: int = 96
     cfg = _read_json(sim_dir / "config.json")
     status = _read_json(sim_dir / "status.json")
     times_arr = np.array(times, dtype=np.float32)
-    meta = _metadata(sim_dir, cfg, status, times_arr, interp)
-    return np.stack(snaps, axis=0), times_arr, mask, cfg, meta, interp
+    snaps_arr = np.stack(snaps, axis=0)
+    snaps_arr, neutral_values = neutralize_nonfluid_primitives(snaps_arr, mask, cfg, status)
+    meta = _metadata(sim_dir, cfg, status, times_arr, interp, mask, neutral_values)
+    return snaps_arr, times_arr, mask, cfg, meta, interp
 
 
 def viscosity_law_one_hot(law: str | None) -> np.ndarray:
@@ -249,27 +342,38 @@ def eos_type_one_hot(eos_type: str | None) -> np.ndarray:
 
 def pde_fingerprint(cfg: Dict) -> np.ndarray:
     """Numerical fingerprint used only for diagnostics (NOT fed to model)."""
+    gamma = float(cfg.get("gamma", 0.0))
+    C_v = float(cfg.get("C_v", 0.0))
+    rho_inf = float(cfg.get("rho_inf", 0.0))
+    T_inf = float(cfg.get("T_inf", 0.0))
+    p_inf_value = float(cfg.get("p_inf", 0.0))
+    pressure_scale = C_v * (gamma - 1.0) * rho_inf * T_inf
+    p_inf_ratio_value = float(cfg.get("p_inf_ratio", 0.0))
+    if "p_inf_ratio" not in cfg and pressure_scale > 0:
+        p_inf_ratio_value = gamma * p_inf_value / pressure_scale
     base = np.array([
-        cfg.get("gamma", 0.0),
+        gamma,
         cfg.get("viscosity", 0.0),
         cfg.get("visc_bulk", 0.0),
         cfg.get("thermal_cond", 0.0),
-        cfg.get("C_v", 0.0),
+        C_v,
         cfg.get("T_0", 0.0),
-        cfg.get("rho_inf", 0.0),
-        cfg.get("T_inf", 0.0),
+        rho_inf,
+        T_inf,
         cfg.get("v_n_inf", 0.0),
     ], dtype=np.float32)
     law = str(cfg.get("viscosity_law", "sutherland"))
     power_law_n = np.array([cfg.get("power_law_n", 0.75)], dtype=np.float32)
     eos_type = str(cfg.get("eos_type", "ideal"))
-    p_inf = np.array([cfg.get("p_inf", 0.0)], dtype=np.float32)
+    p_inf = np.array([p_inf_value], dtype=np.float32)
+    p_inf_ratio = np.array([p_inf_ratio_value], dtype=np.float32)
     return np.concatenate([
         base,
         viscosity_law_one_hot(law),
         power_law_n,
         eos_type_one_hot(eos_type),
         p_inf,
+        p_inf_ratio,
     ]).astype(np.float32)
 
 

@@ -22,6 +22,7 @@ from .pde import (
     BASE_PDE_NAMES,
     DEFAULT_PDE_VEC_NAMES,
     OLD_13D_PDE_VEC_NAMES,
+    OLD_16D_PDE_VEC_NAMES,
     compute_pde_metrics,
     compute_pde_normalizer,
     infer_pde_schema,
@@ -50,9 +51,18 @@ def _pde_vec_16(law_index: int, eos_index: int, p_inf: float) -> np.ndarray:
     ]).astype(np.float32)
 
 
+def _pde_vec_17(law_index: int, eos_index: int, p_inf: float,
+                p_inf_ratio: float) -> np.ndarray:
+    return np.concatenate([
+        _pde_vec_16(law_index, eos_index, p_inf),
+        np.array([p_inf_ratio], dtype=np.float32),
+    ]).astype(np.float32)
+
+
 def _write_npz(path: Path, with_mask: bool, pde_dim: int = 13,
                law_index: int = 0, eos_index: int = 0,
-               p_inf: float = 0.0, family: str = "synthetic") -> None:
+               p_inf: float = 0.0, p_inf_ratio: float = 0.0,
+               family: str = "synthetic") -> None:
     rng = np.random.default_rng(123)
     T, C, H, W = 6, 4, 16, 24
     states = rng.normal(size=(T, C, H, W)).astype(np.float32)
@@ -61,9 +71,12 @@ def _write_npz(path: Path, with_mask: bool, pde_dim: int = 13,
     times = np.arange(T, dtype=np.float32) * 0.01
     mask = np.ones((H, W), dtype=np.float32)
     mask[4:8, 9:14] = 0.0
-    if pde_dim == 16:
-        pde_vec = _pde_vec_16(law_index, eos_index, p_inf)
+    if pde_dim == len(DEFAULT_PDE_VEC_NAMES):
+        pde_vec = _pde_vec_17(law_index, eos_index, p_inf, p_inf_ratio)
         pde_names = np.array(DEFAULT_PDE_VEC_NAMES)
+    elif pde_dim == 16:
+        pde_vec = _pde_vec_16(law_index, eos_index, p_inf)
+        pde_names = np.array(OLD_16D_PDE_VEC_NAMES)
     elif pde_dim == 13:
         pde_vec = _pde_vec_13(law_index)
         pde_names = np.array(OLD_13D_PDE_VEC_NAMES)
@@ -96,6 +109,7 @@ def _realistic_pde_vectors(n: int = 96) -> np.ndarray:
     eos_one_hot = np.zeros((n, 2), dtype=np.float32)
     eos_one_hot[np.arange(n), eos_classes] = 1.0
     p_inf = np.where(eos_classes == 1, rng.uniform(1.0, 100.0, size=n), 0.0).astype(np.float32)
+    p_inf_ratio = np.where(eos_classes == 1, rng.uniform(0.02, 0.20, size=n), 0.0).astype(np.float32)
     vectors = np.column_stack([
         rng.uniform(1.2, 1.6, size=n),              # gamma
         10 ** rng.uniform(-4, -2, size=n),          # viscosity
@@ -110,6 +124,7 @@ def _realistic_pde_vectors(n: int = 96) -> np.ndarray:
         rng.uniform(0.3, 1.5, size=(n, 1)),         # power_law_n
         eos_one_hot,
         p_inf.reshape(n, 1),
+        p_inf_ratio.reshape(n, 1),
     ])
     return vectors.astype(np.float32)
 
@@ -134,6 +149,7 @@ def _realistic_pde_vectors_id(n: int = 64) -> np.ndarray:
         np.full((n, 1), 0.75, dtype=np.float32),
         eos_one_hot,
         np.zeros((n, 1), dtype=np.float32),
+        np.zeros((n, 1), dtype=np.float32),
     ])
     return vectors.astype(np.float32)
 
@@ -150,6 +166,8 @@ def _realistic_pde_vectors_ood_mild(n: int = 96) -> np.ndarray:
     eos_one_hot[np.arange(n), eos_classes] = 1.0
     p_inf = np.zeros(n, dtype=np.float32)
     p_inf[eos_classes == 1] = rng.uniform(1.0, 100.0, size=int(np.sum(eos_classes == 1)))
+    p_inf_ratio = np.zeros(n, dtype=np.float32)
+    p_inf_ratio[eos_classes == 1] = rng.uniform(0.02, 0.08, size=int(np.sum(eos_classes == 1)))
     vectors = np.column_stack([
         rng.uniform(1.36, 1.45, size=n),
         10 ** rng.uniform(np.log10(3e-3), np.log10(5e-3), size=n),
@@ -164,6 +182,7 @@ def _realistic_pde_vectors_ood_mild(n: int = 96) -> np.ndarray:
         power_law_n.reshape(n, 1),
         eos_one_hot,
         p_inf.reshape(n, 1),
+        p_inf_ratio.reshape(n, 1),
     ])
     return vectors.astype(np.float32)
 
@@ -218,7 +237,7 @@ def _stress_robust_continuous_loss() -> None:
             raise RuntimeError(f"{name} normalizer has no active continuous indices")
         if name == "id":
             skipped = set(normalizer.get("skipped_continuous_names", []))
-            if {"power_law_n", "p_inf"} - skipped:
+            if {"power_law_n", "p_inf", "p_inf_ratio"} - skipped:
                 raise RuntimeError(f"ID should skip meaningless constant dimensions, got {skipped}")
 
         mean_bias = pde_head_bias_from_normalizer(normalizer).numpy()
@@ -246,6 +265,8 @@ def _stress_robust_continuous_loss() -> None:
         ideal = vectors[:, 13] > 0.5
         perturbed[non_power, 12] = 999.0
         perturbed[ideal, 15] = 999.0
+        if perturbed.shape[1] > 16:
+            perturbed[ideal, 16] = 999.0
         parts = pde_loss_components(
             torch.from_numpy(perturbed),
             torch.from_numpy(vectors),
@@ -268,6 +289,7 @@ def _test_pde_schema_and_fingerprint() -> None:
     schema9 = infer_pde_schema(pde_dim=9)
     schema13 = infer_pde_schema(pde_dim=13)
     schema16 = infer_pde_schema(pde_dim=16)
+    schema17 = infer_pde_schema(pde_dim=17)
     if schema9.get("has_viscosity_law") or schema9.get("has_eos_type"):
         raise RuntimeError("9D schema should not expose categorical PDE slices")
     if not schema13.get("has_viscosity_law") or schema13.get("has_eos_type"):
@@ -276,6 +298,12 @@ def _test_pde_schema_and_fingerprint() -> None:
         raise RuntimeError("16D schema should expose viscosity law and EOS")
     if schema16.get("p_inf_index") != 15 or 15 not in schema16.get("continuous_indices", []):
         raise RuntimeError("16D schema should treat p_inf as continuous index 15")
+    if schema16.get("p_inf_ratio_index") is not None:
+        raise RuntimeError("old 16D schema should not expose p_inf_ratio")
+    if not schema17.get("has_viscosity_law") or not schema17.get("has_eos_type"):
+        raise RuntimeError("17D schema should expose viscosity law and EOS")
+    if schema17.get("p_inf_index") != 15 or schema17.get("p_inf_ratio_index") != 16:
+        raise RuntimeError("17D schema should append p_inf_ratio at index 16")
 
     base_cfg = {
         "gamma": 1.4,
@@ -292,16 +320,17 @@ def _test_pde_schema_and_fingerprint() -> None:
     }
     ideal = pde_fingerprint({**base_cfg, "eos_type": "ideal", "p_inf": 0.0})
     stiffened = pde_fingerprint({**base_cfg, "eos_type": "stiffened_gas", "p_inf": 12.5})
-    if ideal.shape != (16,) or stiffened.shape != (16,):
-        raise RuntimeError(f"new pde_fingerprint length should be 16, got {ideal.shape}, {stiffened.shape}")
+    if ideal.shape != (17,) or stiffened.shape != (17,):
+        raise RuntimeError(f"new pde_fingerprint length should be 17, got {ideal.shape}, {stiffened.shape}")
     if pde_fingerprint_names() != list(DEFAULT_PDE_VEC_NAMES):
         raise RuntimeError("pde_fingerprint_names does not match DEFAULT_PDE_VEC_NAMES")
     if np.allclose(ideal, stiffened):
         raise RuntimeError("ideal and stiffened_gas pde fingerprints should differ")
-    if not np.allclose(ideal[-3:], np.array([1.0, 0.0, 0.0], dtype=np.float32)):
-        raise RuntimeError(f"unexpected ideal EOS suffix: {ideal[-3:]}")
-    if not np.allclose(stiffened[-3:], np.array([0.0, 1.0, 12.5], dtype=np.float32)):
-        raise RuntimeError(f"unexpected stiffened EOS suffix: {stiffened[-3:]}")
+    if not np.allclose(ideal[-4:], np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)):
+        raise RuntimeError(f"unexpected ideal EOS suffix: {ideal[-4:]}")
+    expected_ratio = 1.4 * 12.5 / (2.5 * (1.4 - 1.0) * 1.0 * 100.0)
+    if not np.allclose(stiffened[-4:], np.array([0.0, 1.0, 12.5, expected_ratio], dtype=np.float32)):
+        raise RuntimeError(f"unexpected stiffened EOS suffix: {stiffened[-4:]}")
 
 
 def main() -> None:
@@ -313,19 +342,23 @@ def main() -> None:
         _test_pde_schema_and_fingerprint()
         _stress_pde_normalizer()
         _stress_robust_continuous_loss()
+        grid_current = root / "grid_current"
         grid16 = root / "grid16"
         grid13 = root / "grid13"
         grid9 = root / "grid9"
+        grid_current.mkdir()
         grid16.mkdir()
         grid13.mkdir()
         grid9.mkdir()
+        _write_npz(grid_current / "sim_0000.npz", with_mask=True, pde_dim=17, law_index=0, eos_index=0, p_inf=0.0, p_inf_ratio=0.0, family="id")
+        _write_npz(grid_current / "sim_0001.npz", with_mask=False, pde_dim=17, law_index=2, eos_index=1, p_inf=20.0, p_inf_ratio=0.05, family="ood_mild")
         _write_npz(grid16 / "sim_0000.npz", with_mask=True, pde_dim=16, law_index=0, eos_index=0, p_inf=0.0, family="id")
         _write_npz(grid16 / "sim_0001.npz", with_mask=False, pde_dim=16, law_index=2, eos_index=1, p_inf=20.0, family="ood_mild")
         _write_npz(grid13 / "sim_0000.npz", with_mask=True, pde_dim=13, law_index=0, family="id")
         _write_npz(grid13 / "sim_0001.npz", with_mask=False, pde_dim=13, law_index=2, family="ood_mild")
         _write_npz(grid9 / "sim_0000.npz", with_mask=True, pde_dim=9, law_index=0, family="id")
         _write_npz(grid9 / "sim_0001.npz", with_mask=True, pde_dim=9, law_index=1, family="ood_mild")
-        paths = sorted(grid16.glob("*.npz"))
+        paths = sorted(grid_current.glob("*.npz"))
         ds = CFDWindowDataset(
             paths,
             context_length=3,
@@ -389,7 +422,7 @@ def main() -> None:
         if pde_metrics["viscosity_law"] is None:
             raise RuntimeError("13D synthetic pde_vec did not produce viscosity-law metrics")
         if pde_metrics["eos_type"] is None:
-            raise RuntimeError("16D synthetic pde_vec did not produce EOS metrics")
+            raise RuntimeError("current synthetic pde_vec did not produce EOS metrics")
         _plot_confusion(pde_metrics, root)
         if not (root / "eos_type_confusion.png").exists():
             raise RuntimeError("EOS confusion plot was not written")
@@ -398,6 +431,11 @@ def main() -> None:
         old13_schema = infer_pde_schema(old13_ds.pde_vec_names, old13_ds.pde_dim)
         if not old13_schema.get("has_viscosity_law") or old13_schema.get("has_eos_type"):
             raise RuntimeError("old 13D pde_vec schema compatibility failed")
+
+        old16_ds = CFDWindowDataset(sorted(grid16.glob("*.npz")), context_length=3, prediction_horizon=1)
+        old16_schema = infer_pde_schema(old16_ds.pde_vec_names, old16_ds.pde_dim)
+        if not old16_schema.get("has_eos_type") or old16_schema.get("p_inf_ratio_index") is not None:
+            raise RuntimeError("old 16D pde_vec schema compatibility failed")
 
         old_ds = CFDWindowDataset(sorted(grid9.glob("*.npz")), context_length=3, prediction_horizon=1)
         old_schema = infer_pde_schema(old_ds.pde_vec_names, old_ds.pde_dim)
@@ -451,7 +489,7 @@ def main() -> None:
             "pde_schema": pde_schema,
             "pde_normalizer": pde_normalizer,
         }, ckpt_path)
-        eval_metrics = evaluate(grid16, ckpt_path, root / "eval", context=3, horizon=1,
+        eval_metrics = evaluate(grid_current, ckpt_path, root / "eval", context=3, horizon=1,
                                 batch_size=1, device="cpu", rollout_steps="")
         if "pde_identification" not in eval_metrics:
             raise RuntimeError("synthetic evaluation did not produce PDE identification metrics")
@@ -464,7 +502,7 @@ def main() -> None:
         if eval_pde_payload.get("eos_type") is None:
             raise RuntimeError("synthetic evaluation did not write EOS metrics")
         scaling = evaluate_context_scaling(
-            grid16,
+            grid_current,
             ckpt_path,
             root / "context_scaling",
             contexts=[2, 3, 8],
@@ -480,7 +518,7 @@ def main() -> None:
             raise RuntimeError("context scaling metrics JSON was not written")
         baseline_train = train(
             TrainConfig(
-                grid_dir=str(grid16),
+                grid_dir=str(grid_current),
                 out_dir=str(root / "train_baseline"),
                 context_length=3,
                 prediction_horizon=1,
@@ -503,7 +541,7 @@ def main() -> None:
             raise RuntimeError("baseline train smoke produced non-finite loss")
         pushforward_train = train(
             TrainConfig(
-                grid_dir=str(grid16),
+                grid_dir=str(grid_current),
                 out_dir=str(root / "train_pushforward"),
                 context_length=3,
                 prediction_horizon=1,

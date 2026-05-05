@@ -41,6 +41,44 @@ from typing import Dict, Mapping, Tuple
 import numpy as np
 
 
+EOS_VERSION = "stiffened_gas_gamma_pinf_v1"
+EOS_P_FLOOR = 1e-8
+
+
+def _reference_pressure_scale(params: Mapping[str, float]) -> float:
+    gamma = float(params["gamma"])
+    C_v = float(params["C_v"])
+    rho_ref = float(params["rho_inf"])
+    T_ref = float(params["T_inf"])
+    R = C_v * (gamma - 1.0)
+    return R * rho_ref * T_ref
+
+
+def p_inf_from_ratio(params: Mapping[str, float], p_inf_ratio: float) -> float:
+    """Convert nondimensional stiffness ratio to absolute p_inf."""
+    gamma = float(params["gamma"])
+    return float(p_inf_ratio) * _reference_pressure_scale(params) / gamma
+
+
+def eos_reference_state(params: Mapping[str, float]) -> Dict[str, float]:
+    """Representative pressure and sound-speed arguments for sampled EOS."""
+    gamma = float(params["gamma"])
+    p_inf = float(params.get("p_inf", 0.0))
+    pressure_scale = _reference_pressure_scale(params)
+    P_ref = pressure_scale - gamma * p_inf
+    return {
+        "pressure_scale": pressure_scale,
+        "P_ref": P_ref,
+        "c2_arg_ref": P_ref + p_inf,
+    }
+
+
+def stiffened_reference_safe(params: Mapping[str, float],
+                             p_floor: float = EOS_P_FLOOR) -> bool:
+    ref = eos_reference_state(params)
+    return ref["P_ref"] > p_floor and ref["c2_arg_ref"] > p_floor
+
+
 # --------------------------------------------------------------------------
 # 1. The PDE-family sampler
 # --------------------------------------------------------------------------
@@ -55,7 +93,7 @@ class FamilySpec:
     viscosity_laws: Tuple[str, ...] = ("sutherland",)
     power_law_n: Tuple[float, float] = (0.6, 1.0)
     eos_types: Tuple[str, ...] = ("ideal",)
-    p_inf: Tuple[float, float] = (0.0, 0.0)
+    p_inf_ratio: Tuple[float, float] = (0.0, 0.0)
 
     def sample_physics(self, rng: np.random.Generator) -> Dict:
         params = {k: float(rng.uniform(*v)) for k, v in self.physical.items()}
@@ -67,10 +105,20 @@ class FamilySpec:
         )
         eos_type = str(rng.choice(self.eos_types))
         params["eos_type"] = eos_type
-        params["p_inf"] = (
-            float(rng.uniform(*self.p_inf))
-            if eos_type == "stiffened_gas" else 0.0
-        )
+        if eos_type == "stiffened_gas":
+            for _ in range(16):
+                ratio = float(rng.uniform(*self.p_inf_ratio))
+                params["p_inf_ratio"] = ratio
+                params["p_inf"] = p_inf_from_ratio(params, ratio)
+                if stiffened_reference_safe(params):
+                    break
+            else:
+                ratio = max(0.0, min(float(self.p_inf_ratio[0]), 0.2))
+                params["p_inf_ratio"] = ratio
+                params["p_inf"] = p_inf_from_ratio(params, ratio)
+        else:
+            params["p_inf_ratio"] = 0.0
+            params["p_inf"] = 0.0
         return params
 
     def sample_mesh(self, rng: np.random.Generator) -> Dict:
@@ -103,14 +151,15 @@ FAMILY_SPECS: Dict[str, FamilySpec] = {
         },
         viscosity_laws=("sutherland",),
         eos_types=("ideal",),
-        p_inf=(0.0, 0.0),
+        p_inf_ratio=(0.0, 0.0),
     ),
     "ood_mild": FamilySpec(
         name="ood_mild",
         description=(
             "Mild OOD family adjacent to ID: slightly higher gamma, viscosity, "
             "thermal conductivity, and inflow speed without pushing far into "
-            "known unstable regimes."
+            "known unstable regimes. EOS sampling is mixed ideal/stiffened, "
+            "with nondimensional p_inf_ratio in [0.02, 0.08] for stiffened cases."
         ),
         physical={
             "gamma": (1.36, 1.45),
@@ -131,13 +180,14 @@ FAMILY_SPECS: Dict[str, FamilySpec] = {
         viscosity_laws=("sutherland", "constant", "power_law"),
         power_law_n=(0.55, 0.95),
         eos_types=("ideal", "stiffened_gas"),
-        p_inf=(0.0, 100.0),
+        p_inf_ratio=(0.02, 0.08),
     ),
     "ood_hard": FamilySpec(
         name="ood_hard",
         description=(
             "Harder OOD family for evaluation, not the first training target: "
             "larger gas-constant and transport shifts plus faster inflow. "
+            "Uses stiffened gas with nondimensional p_inf_ratio in [0.08, 0.20]. "
             "Use more retries and validation filtering."
         ),
         physical={
@@ -159,7 +209,7 @@ FAMILY_SPECS: Dict[str, FamilySpec] = {
         viscosity_laws=("constant", "power_law"),
         power_law_n=(0.4, 1.2),
         eos_types=("stiffened_gas",),
-        p_inf=(50.0, 300.0),
+        p_inf_ratio=(0.08, 0.20),
     ),
 }
 
@@ -185,8 +235,8 @@ KEY_STATUS_FIELDS = (
     "fixed_geometry_spec",
     "lnscale", "min_A", "max_A",
     "gamma", "viscosity", "viscosity_law", "power_law_n",
-    "eos_type", "p_inf",
-    "visc_bulk", "thermal_cond", "C_v",
+    "eos_type", "p_inf", "p_inf_ratio", "eos_version",
+    "visc_bulk", "thermal_cond", "S_const", "C_v",
     "T_0", "rho_inf", "T_inf", "v_n_inf",
 )
 
@@ -262,8 +312,10 @@ def _configure_cfg(cfg, params):
     cfg.power_law_n = params.get('power_law_n', 0.75)
     cfg.eos_type = params.get('eos_type', 'ideal')
     cfg.p_inf = params.get('p_inf', 0.0)
+    cfg.eos_version = params.get('eos_version', 'stiffened_gas_gamma_pinf_v1')
     cfg.visc_bulk = params['visc_bulk']
     cfg.thermal_cond = params['thermal_cond']
+    cfg.S_const = params.get('S_const', cfg.S_const)
     cfg.C_v = params['C_v']
     cfg.T_0 = params['T_0']
     cfg.inlet_cfg.rho_inf = params['rho_inf']
@@ -617,8 +669,8 @@ if __name__ == '__main__':
 MANIFEST_PARAM_KEYS = (
     "family", "geometry_mode", "fixed_geometry_spec", "mesh_seed",
     "gamma", "viscosity", "viscosity_law", "power_law_n",
-    "eos_type", "p_inf",
-    "visc_bulk", "thermal_cond", "C_v",
+    "eos_type", "p_inf", "p_inf_ratio", "eos_version",
+    "visc_bulk", "thermal_cond", "S_const", "C_v",
     "T_0", "rho_inf", "T_inf", "v_n_inf", "lnscale", "min_A", "max_A",
 )
 
@@ -664,8 +716,11 @@ def _write_status(out_dir: Path, params: Dict, status: str, *,
         "power_law_n": params.get("power_law_n"),
         "eos_type": params.get("eos_type"),
         "p_inf": params.get("p_inf"),
+        "p_inf_ratio": params.get("p_inf_ratio"),
+        "eos_version": params.get("eos_version"),
         "visc_bulk": params.get("visc_bulk"),
         "thermal_cond": params.get("thermal_cond"),
+        "S_const": params.get("S_const"),
         "C_v": params.get("C_v"),
         "T_0": params.get("T_0"),
         "rho_inf": params.get("rho_inf"),
@@ -908,11 +963,27 @@ def main() -> None:
         if args.eos_type != "family":
             physics["eos_type"] = args.eos_type
             if args.eos_type == "stiffened_gas":
-                physics["p_inf"] = float(args.p_inf) if args.p_inf is not None else 0.0
+                if args.p_inf is not None:
+                    physics["p_inf"] = float(args.p_inf)
+                    scale = _reference_pressure_scale(physics)
+                    physics["p_inf_ratio"] = (
+                        float(physics["gamma"]) * physics["p_inf"] / scale
+                        if scale > 0 else 0.0
+                    )
+                else:
+                    ratio = float(rng.uniform(*family.p_inf_ratio))
+                    physics["p_inf_ratio"] = ratio
+                    physics["p_inf"] = p_inf_from_ratio(physics, ratio)
             else:
                 physics["p_inf"] = 0.0
+                physics["p_inf_ratio"] = 0.0
         elif args.p_inf is not None and physics.get("eos_type") == "stiffened_gas":
             physics["p_inf"] = float(args.p_inf)
+            scale = _reference_pressure_scale(physics)
+            physics["p_inf_ratio"] = (
+                float(physics["gamma"]) * physics["p_inf"] / scale
+                if scale > 0 else 0.0
+            )
         if args.geometry_mode == "fixed_ellipse":
             if args.sample_mesh_params and i == 0:
                 print(
@@ -936,6 +1007,8 @@ def main() -> None:
             "family": family.name,
             "problem": args.problem,
             "geometry_mode": args.geometry_mode,
+            "eos_version": EOS_VERSION,
+            "S_const": 110.4,
             "fixed_geometry_spec": (
                 {
                     "domain": [0.0, 0.0, 2.0, 1.5],
@@ -989,6 +1062,7 @@ def main() -> None:
         "ood": args.ood,
         "problem": args.problem,
         "geometry_mode": args.geometry_mode,
+        "eos_version": EOS_VERSION,
         "seed": args.seed,
         "max_mesh_retries": args.max_mesh_retries,
         "mesh_attempt_timeout_s": args.mesh_attempt_timeout_s,
@@ -1005,6 +1079,7 @@ def main() -> None:
             "power_law_n_override": args.power_law_n,
             "eos_type_override": args.eos_type,
             "p_inf_override": args.p_inf,
+            "eos_version": EOS_VERSION,
             "geometry_mode": args.geometry_mode,
             "base_mesh": {
                 "lnscale": args.lnscale,
