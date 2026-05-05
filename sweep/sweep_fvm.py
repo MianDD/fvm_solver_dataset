@@ -445,6 +445,22 @@ def _load_primitives(path):
     return cells
 
 
+def _eos_sound_speed(params, rho, T):
+    gamma = float(params.get("gamma", 1.4))
+    C_v = float(params.get("C_v", 2.5))
+    R = C_v * (gamma - 1.0)
+    rho_safe = np.maximum(np.asarray(rho, dtype=np.float64), 1e-12)
+    T_safe = np.maximum(np.asarray(T, dtype=np.float64), 1e-12)
+    eos_type = str(params.get("eos_type", "ideal"))
+    p_inf = float(params.get("p_inf", 0.0))
+    if eos_type == "stiffened_gas":
+        pressure = R * rho_safe * T_safe - gamma * p_inf
+        c2_arg = gamma * (pressure + p_inf) / rho_safe
+    else:
+        c2_arg = gamma * R * T_safe
+    return np.sqrt(np.maximum(c2_arg, 0.0))
+
+
 def _validate_saved_snapshots(params):
     files = _snapshot_files(params["out_dir"])
     validation = {
@@ -464,18 +480,22 @@ def _validate_saved_snapshots(params):
     rho_min = float(params.get("rho_min", 1e-9))
     T_min = float(params.get("T_min", 1e-9))
     max_abs_value = float(params.get("max_abs_value", 1e6))
+    max_mach_allowed = float(params.get("max_mach", 30.0))
     validation.update({
         "rho_min": rho_min,
         "T_min": T_min,
         "max_abs_value": max_abs_value,
+        "max_mach_allowed": max_mach_allowed,
         "rho_observed_min": None,
         "T_observed_min": None,
         "max_abs_observed": None,
+        "max_mach_observed": None,
     })
 
     rho_obs = []
     T_obs = []
     abs_obs = []
+    mach_obs = []
     for path in files:
         cells = _load_primitives(path)
         if not np.all(np.isfinite(cells)):
@@ -483,13 +503,24 @@ def _validate_saved_snapshots(params):
             return False, "snapshot_validation", f"non-finite values in {path.name}", validation
         rho = cells[:, 2]
         T = cells[:, 3]
+        speed = np.sqrt(cells[:, 0].astype(np.float64) ** 2 + cells[:, 1].astype(np.float64) ** 2)
+        c = _eos_sound_speed(params, rho, T)
+        if not np.all(np.isfinite(c)) or np.any(c <= 0.0):
+            validation["bad_file"] = path.name
+            return False, "snapshot_validation", f"invalid sound speed in {path.name}", validation
+        mach = speed / np.maximum(c, 1e-12)
+        if not np.all(np.isfinite(mach)):
+            validation["bad_file"] = path.name
+            return False, "snapshot_validation", f"non-finite Mach number in {path.name}", validation
         rho_obs.append(float(np.min(rho)))
         T_obs.append(float(np.min(T)))
         abs_obs.append(float(np.max(np.abs(cells))))
+        mach_obs.append(float(np.max(mach)))
 
     validation["rho_observed_min"] = float(np.min(rho_obs))
     validation["T_observed_min"] = float(np.min(T_obs))
     validation["max_abs_observed"] = float(np.max(abs_obs))
+    validation["max_mach_observed"] = float(np.max(mach_obs))
     if validation["rho_observed_min"] <= rho_min:
         return False, "snapshot_validation", (
             f"density below lower bound: {validation['rho_observed_min']:.4g} <= {rho_min:.4g}"
@@ -501,6 +532,10 @@ def _validate_saved_snapshots(params):
     if validation["max_abs_observed"] > max_abs_value:
         return False, "snapshot_validation", (
             f"value explosion: max abs {validation['max_abs_observed']:.4g} > {max_abs_value:.4g}"
+        ), validation
+    if validation["max_mach_observed"] > max_mach_allowed:
+        return False, "snapshot_validation", (
+            f"Mach number above limit: {validation['max_mach_observed']:.4g} > {max_mach_allowed:.4g}"
         ), validation
     return True, None, None, validation
 
@@ -666,6 +701,49 @@ if __name__ == '__main__':
 """
 
 
+def validation_sound_speed(params: Mapping[str, float], rho, T):
+    """Sound speed used by saved-snapshot validation.
+
+    This mirrors the runner-side validation helper so lightweight smoke tests
+    can exercise the same EOS sanity rule without launching the solver.
+    """
+    gamma = float(params.get("gamma", 1.4))
+    C_v = float(params.get("C_v", 2.5))
+    R = C_v * (gamma - 1.0)
+    rho_safe = np.maximum(np.asarray(rho, dtype=np.float64), 1e-12)
+    T_safe = np.maximum(np.asarray(T, dtype=np.float64), 1e-12)
+    eos_type = str(params.get("eos_type", "ideal"))
+    p_inf = float(params.get("p_inf", 0.0))
+    if eos_type == "stiffened_gas":
+        pressure = R * rho_safe * T_safe - gamma * p_inf
+        c2_arg = gamma * (pressure + p_inf) / rho_safe
+    else:
+        c2_arg = gamma * R * T_safe
+    return np.sqrt(np.maximum(c2_arg, 0.0))
+
+
+def validate_snapshot_cells(cells: np.ndarray, params: Mapping[str, float]) -> Dict[str, float]:
+    """Return primitive-state validation observations for one cell array."""
+    cells = np.asarray(cells, dtype=np.float32)
+    if not np.all(np.isfinite(cells)):
+        raise ValueError("non-finite primitive values")
+    rho = cells[:, 2]
+    T = cells[:, 3]
+    speed = np.sqrt(cells[:, 0].astype(np.float64) ** 2 + cells[:, 1].astype(np.float64) ** 2)
+    c = validation_sound_speed(params, rho, T)
+    if not np.all(np.isfinite(c)) or np.any(c <= 0.0):
+        raise ValueError("invalid sound speed")
+    mach = speed / np.maximum(c, 1e-12)
+    if not np.all(np.isfinite(mach)):
+        raise ValueError("non-finite Mach number")
+    return {
+        "rho_observed_min": float(np.min(rho)),
+        "T_observed_min": float(np.min(T)),
+        "max_abs_observed": float(np.max(np.abs(cells))),
+        "max_mach_observed": float(np.max(mach)),
+    }
+
+
 MANIFEST_PARAM_KEYS = (
     "family", "geometry_mode", "fixed_geometry_spec", "mesh_seed",
     "gamma", "viscosity", "viscosity_law", "power_law_n",
@@ -773,6 +851,11 @@ def _manifest_record(params: Dict, out_dir: Path, status_record: Dict,
         rec["invalid_stage"] = status_record["invalid_stage"]
     if "number_of_snapshots_saved" in status_record:
         rec["number_of_snapshots_saved"] = status_record["number_of_snapshots_saved"]
+    validation = status_record.get("validation", {})
+    if isinstance(validation, dict):
+        for key in ("max_mach_observed", "max_mach_allowed"):
+            if key in validation:
+                rec[key] = validation[key]
     if elapsed_s is not None:
         rec["elapsed_s"] = round(elapsed_s, 3)
     if return_code is not None:
@@ -918,6 +1001,8 @@ def main() -> None:
                     help="strict lower bound for temperature during validation")
     ap.add_argument("--max-abs-value", type=float, default=1e6,
                     help="upper bound for absolute primitive values during validation")
+    ap.add_argument("--max-mach", type=float, default=30.0,
+                    help="upper bound for saved-snapshot Mach number during validation")
     args = ap.parse_args()
 
     family_name = "ood_mild" if args.ood and args.family == "id" else args.family
@@ -1036,6 +1121,7 @@ def main() -> None:
             "rho_min": args.rho_min,
             "T_min": args.T_min,
             "max_abs_value": args.max_abs_value,
+            "max_mach": args.max_mach,
             **physics,
         }
         sim_record = run_one_sim(repo, Path(params["out_dir"]), params)
@@ -1091,6 +1177,7 @@ def main() -> None:
             "rho_min": args.rho_min,
             "T_min": args.T_min,
             "max_abs_value": args.max_abs_value,
+            "max_mach": args.max_mach,
         },
         "simulations": sim_records,
     }

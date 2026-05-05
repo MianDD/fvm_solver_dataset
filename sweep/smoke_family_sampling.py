@@ -13,6 +13,7 @@ from .sweep_fvm import (
     eos_reference_state,
     p_inf_from_ratio,
     stiffened_reference_safe,
+    validate_snapshot_cells,
 )
 
 
@@ -50,6 +51,30 @@ def _check_stiffened(params: dict, lo: float, hi: float) -> None:
         raise RuntimeError(f"non-positive representative EOS state: {ref}")
 
 
+def _check_snapshot_mach_validation() -> None:
+    params = {
+        "max_mach": 30.0,
+        "gamma": 1.4,
+        "C_v": 2.5,
+        "eos_type": "ideal",
+        "p_inf": 0.0,
+    }
+    valid_cells = np.array(
+        [[1.0, 0.0, 1.0, 100.0], [0.5, 0.1, 1.1, 101.0]],
+        dtype=np.float32,
+    )
+    fast_cells = valid_cells.copy()
+    fast_cells[:, 0] = 1000.0
+    validation = validate_snapshot_cells(valid_cells, params)
+    if validation["max_mach_observed"] <= 0.0:
+        raise RuntimeError(f"valid snapshot did not record max Mach: {validation}")
+    if validation["max_mach_observed"] > params["max_mach"]:
+        raise RuntimeError(f"valid synthetic state exceeded max Mach: {validation}")
+    validation = validate_snapshot_cells(fast_cells, params)
+    if validation["max_mach_observed"] <= params["max_mach"]:
+        raise RuntimeError(f"extreme-velocity synthetic state should exceed max Mach: {validation}")
+
+
 def main() -> None:
     id_samples = _samples("id")
     if not all(p["eos_type"] == "ideal" for p in id_samples):
@@ -79,6 +104,7 @@ def main() -> None:
     hard_ratios = np.array([float(p["p_inf_ratio"]) for p in hard_samples], dtype=np.float64)
     if not float(hard_ratios.mean()) > float(mild_ratios.mean()):
         raise RuntimeError("OOD-hard should use larger p_inf_ratio values than OOD-mild")
+    _check_snapshot_mach_validation()
 
     print(
         "OK family sampling: "

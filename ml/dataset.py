@@ -142,10 +142,38 @@ def _safe_dt(a: float, b: float, fallback: float = 1.0) -> float:
     return dt
 
 
+def mask_derivative_cleanup_region(mask: np.ndarray) -> np.ndarray:
+    """Return cells where derivative features should be zeroed.
+
+    The region is the one-cell dilation of non-fluid cells.  That removes
+    finite-difference jumps caused by neutral solid values without modifying
+    the physical primitive channels themselves.
+    """
+    fluid = np.asarray(mask, dtype=np.float32) > 0.5
+    solid = ~fluid
+    cleanup = solid.copy()
+    H, W = cleanup.shape
+    for dj in (-1, 0, 1):
+        for di in (-1, 0, 1):
+            if dj == 0 and di == 0:
+                continue
+            src_j0 = max(0, -dj)
+            src_j1 = min(H, H - dj)
+            src_i0 = max(0, -di)
+            src_i1 = min(W, W - di)
+            dst_j0 = max(0, dj)
+            dst_j1 = min(H, H + dj)
+            dst_i0 = max(0, di)
+            dst_i1 = min(W, W + di)
+            cleanup[dst_j0:dst_j1, dst_i0:dst_i1] |= solid[src_j0:src_j1, src_i0:src_i1]
+    return cleanup
+
+
 def compute_derivative_features(frames: np.ndarray, times: np.ndarray | None = None,
                                 dx_spacing: float | None = None,
                                 dy_spacing: float | None = None,
-                                mode: str = "central") -> np.ndarray:
+                                mode: str = "central",
+                                mask: np.ndarray | None = None) -> np.ndarray:
     """Concatenate physical channels with dx, dy, and dt features.
 
     Parameters
@@ -157,6 +185,10 @@ def compute_derivative_features(frames: np.ndarray, times: np.ndarray | None = N
         stamps fall back to unit spacing for the temporal derivative.
     mode:
         Currently ``central``.  Boundaries use one-sided differences.
+    mask:
+        Optional fluid mask shaped ``(H, W)``.  If present, derivative
+        channels are zeroed at non-fluid cells and fluid cells adjacent to
+        non-fluid cells.
     """
     if mode != "central":
         raise ValueError(f"Unsupported derivative mode: {mode}")
@@ -192,6 +224,14 @@ def compute_derivative_features(frames: np.ndarray, times: np.ndarray | None = N
                 denom = _safe_dt(times_arr[i - 1], times_arr[i + 1], fallback=2.0)
                 dt[i] = (x[i + 1] - x[i - 1]) / denom
 
+    if mask is not None:
+        cleanup = mask_derivative_cleanup_region(mask)
+        if cleanup.shape != x.shape[-2:]:
+            raise ValueError(f"mask shape {cleanup.shape} does not match grid {x.shape[-2:]}")
+        dx[..., cleanup] = 0.0
+        dy[..., cleanup] = 0.0
+        dt[..., cleanup] = 0.0
+
     return np.concatenate([x, dx, dy, dt], axis=1).astype(np.float32)
 
 
@@ -213,6 +253,7 @@ def build_input_features(frames: np.ndarray, times: np.ndarray | None = None,
             dx_spacing=dx_spacing,
             dy_spacing=dy_spacing,
             mode=derivative_mode,
+            mask=mask,
         )
     if use_mask_channel:
         if mask is None:

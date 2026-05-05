@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .dataset import CFDWindowDataset
+from .dataset import CFDWindowDataset, build_input_features, mask_derivative_cleanup_region
 from .grid_adapter import CHANNEL_NAMES, assemble_dataset
 from .pde import DEFAULT_PDE_VEC_NAMES
 
@@ -155,6 +155,38 @@ def main() -> None:
             raise RuntimeError("converted grid did not load through CFDWindowDataset")
         if sample["pde_vec"].numel() != len(DEFAULT_PDE_VEC_NAMES):
             raise RuntimeError("dataset did not preserve current pde_vec length")
+
+        deriv_mask = np.ones((7, 7), dtype=np.float32)
+        deriv_mask[3, 3] = 0.0
+        yy, xx = np.meshgrid(
+            np.arange(7, dtype=np.float32),
+            np.arange(7, dtype=np.float32),
+            indexing="ij",
+        )
+        frames = np.zeros((2, 4, 7, 7), dtype=np.float32)
+        frames[0, 0] = xx + yy
+        frames[1, 0] = xx + yy + 1.0
+        frames[:, 1] = 2.0 * xx
+        frames[:, 2] = 1.0 + 0.1 * yy
+        frames[:, 3] = 100.0 + xx
+        features = build_input_features(
+            frames,
+            times=np.array([0.0, 1.0], dtype=np.float32),
+            dx_spacing=1.0,
+            dy_spacing=1.0,
+            use_derivatives=True,
+            mask=deriv_mask,
+        )
+        cleanup = mask_derivative_cleanup_region(deriv_mask)
+        deriv = features[:, 4:16]
+        if not np.allclose(deriv[..., cleanup], 0.0, rtol=0.0, atol=1e-7):
+            raise RuntimeError("derivative features were not zeroed on solid/near-solid cells")
+        if not cleanup[3, 3] or not cleanup[3, 2] or not cleanup[2, 2]:
+            raise RuntimeError("cleanup region should include solid and one-cell neighbours")
+        far = np.zeros_like(cleanup, dtype=bool)
+        far[0, 0] = True
+        if not np.any(np.abs(deriv[..., far]) > 0.0):
+            raise RuntimeError("derivative cleanup erased non-boundary derivative information")
 
         print(
             "OK grid mask smoke: "
