@@ -52,6 +52,7 @@ eval/
 figures/predictions/
 figures/generated/
 figures/report1/
+tables/report1/
 
 # Local model checkpoints / training outputs
 checkpoints/
@@ -79,4 +80,5 @@ datasets/grid_ood*/
 tmp/
 temp/
 _attention_smoke_*/
+_report1_collect_*/
 *.tmp

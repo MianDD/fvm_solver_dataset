@@ -503,6 +503,46 @@ Expected evaluation outputs:
 
 ## Plotting And Report Tables
 
+### Collect Report 1 Figures And CSV Tables
+
+After training and evaluation runs have written `history.json` and
+`metrics.json`, collect the report-ready summary files with:
+
+```powershell
+.\.venv\Scripts\python.exe -m ml.report1_collect_results `
+  --runs checkpoints\report1 `
+  --eval-root eval\report1 `
+  --out-figures figures\report1 `
+  --out-tables tables\report1
+```
+
+This command is robust to incomplete experiment sets: if a run or metric is
+missing, it prints a warning and writes the tables/figures that can be built
+from the available JSON files.
+
+Expected CSV outputs when data exists:
+
+```text
+tables/report1/main_results.csv
+tables/report1/ablation_results.csv
+tables/report1/pde_aux_metrics.csv
+tables/report1/training_history_summary.csv
+```
+
+Expected figure outputs when data exists:
+
+```text
+figures/report1/loss_curves.png
+figures/report1/id_vs_ood_mse.png
+figures/report1/channel_mse.png
+figures/report1/pde_aux_metrics.png
+```
+
+`main_results.csv` and `id_vs_ood_mse.png` are built from evaluation folders
+whose names do not contain `ablat`. Folders containing `ablat` are collected in
+`ablation_results.csv`, so use clear folder names such as
+`ablate_global_on_id`.
+
 ### Prediction vs Ground Truth Fields
 
 ```powershell
@@ -566,10 +606,9 @@ checkpoints/report1/<run>/history.json
 checkpoints/report1/<run>/metrics.json
 ```
 
-There is currently no dedicated CLI for training-loss curves. Use
-`history.json` directly for Report 1 tables or plot it in a notebook/script.
-Do not invent a new plotting command in the report without adding and testing
-the script first.
+Use the collector above to generate `figures/report1/loss_curves.png` and
+`tables/report1/training_history_summary.csv` from those files. The raw
+`history.json` remains the source of truth if you need custom notebook plots.
 
 ## Optional Slurm/HPC Notes
 
