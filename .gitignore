@@ -82,3 +82,14 @@ temp/
 _attention_smoke_*/
 _report1_collect_*/
 *.tmp
+
+
+
+datasets/
+tools/
+checkpoints/
+eval/
+figures/
+tables/
+logs/
+slurm_logs/
