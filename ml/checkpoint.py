@@ -14,6 +14,8 @@ MODEL_KWARGS = {
     "n_channels", "n_input_channels", "n_target_channels", "H", "W",
     "patch_size", "d_model", "n_heads", "n_layers", "max_context",
     "dropout", "mlp_ratio", "attention_type", "pos_encoding", "pde_dim",
+    "use_boundary_channels", "boundary_channels", "boundary_aware_refine",
+    "boundary_channel_start",
 }
 
 
@@ -43,6 +45,9 @@ def load_model_from_checkpoint(path: str | Path, device: str = "cpu") -> Tuple[F
     model_cfg.setdefault("attention_type", "global")
     model_cfg.setdefault("pos_encoding", "learned_absolute")
     model_cfg.setdefault("pde_dim", 0)
+    model_cfg.setdefault("use_boundary_channels", False)
+    model_cfg.setdefault("boundary_channels", 6)
+    model_cfg.setdefault("boundary_aware_refine", False)
     model_kwargs = {k: v for k, v in model_cfg.items() if k in MODEL_KWARGS}
     model = FoundationCFDModel(**model_kwargs).to(device)
     model.load_state_dict(ckpt["model"])

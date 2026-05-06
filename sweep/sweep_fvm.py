@@ -94,15 +94,31 @@ class FamilySpec:
     power_law_n: Tuple[float, float] = (0.6, 1.0)
     eos_types: Tuple[str, ...] = ("ideal",)
     p_inf_ratio: Tuple[float, float] = (0.0, 0.0)
+    log_uniform_keys: Tuple[str, ...] = ()
+    fixed_prandtl: float | None = None
 
     def sample_physics(self, rng: np.random.Generator) -> Dict:
-        params = {k: float(rng.uniform(*v)) for k, v in self.physical.items()}
+        params = {}
+        for key, bounds in self.physical.items():
+            lo, hi = float(bounds[0]), float(bounds[1])
+            if key in self.log_uniform_keys:
+                if lo <= 0.0 or hi <= 0.0:
+                    raise ValueError(f"log-uniform family key {key!r} needs positive bounds")
+                params[key] = float(np.exp(rng.uniform(np.log(lo), np.log(hi))))
+            else:
+                params[key] = float(rng.uniform(lo, hi))
         law = str(rng.choice(self.viscosity_laws))
         params["viscosity_law"] = law
         params["power_law_n"] = (
             float(rng.uniform(*self.power_law_n))
             if law == "power_law" else 0.75
         )
+        if self.fixed_prandtl is not None:
+            pr = float(self.fixed_prandtl)
+            cp = float(params["gamma"]) * float(params["C_v"])
+            params["thermal_cond"] = float(params["viscosity"]) * cp / pr
+            params["Pr"] = pr
+            params["thermal_cond_policy"] = "fixed_prandtl"
         eos_type = str(rng.choice(self.eos_types))
         params["eos_type"] = eos_type
         if eos_type == "stiffened_gas":
@@ -211,6 +227,61 @@ FAMILY_SPECS: Dict[str, FamilySpec] = {
         eos_types=("stiffened_gas",),
         p_inf_ratio=(0.08, 0.20),
     ),
+    "id_visc_only": FamilySpec(
+        name="id_visc_only",
+        description=(
+            "Focused viscosity-only ID family for fixed-obstacle roll-up "
+            "experiments. Ideal gas, constant viscosity law, fixed thermodynamic "
+            "and inflow state; only shear viscosity varies log-uniformly."
+        ),
+        physical={
+            "gamma": (1.4, 1.4),
+            "viscosity": (1e-3, 5e-3),
+            "visc_bulk": (0.0, 0.0),
+            "C_v": (2.5, 2.5),
+            "T_0": (100.0, 100.0),
+            "rho_inf": (1.0, 1.0),
+            "T_inf": (100.0, 100.0),
+            "v_n_inf": (4.0, 4.0),
+        },
+        mesh={
+            "lnscale": (4.0, 6.0),
+            "min_A": (0.02, 0.04),
+            "max_A": (0.04, 0.08),
+        },
+        viscosity_laws=("constant",),
+        eos_types=("ideal",),
+        p_inf_ratio=(0.0, 0.0),
+        log_uniform_keys=("viscosity",),
+        fixed_prandtl=0.71,
+    ),
+    "ood_visc_only": FamilySpec(
+        name="ood_visc_only",
+        description=(
+            "Focused viscosity-only OOD family with the same fixed ideal-gas "
+            "state as id_visc_only, but a disjoint higher shear-viscosity range."
+        ),
+        physical={
+            "gamma": (1.4, 1.4),
+            "viscosity": (5e-3, 2e-2),
+            "visc_bulk": (0.0, 0.0),
+            "C_v": (2.5, 2.5),
+            "T_0": (100.0, 100.0),
+            "rho_inf": (1.0, 1.0),
+            "T_inf": (100.0, 100.0),
+            "v_n_inf": (4.0, 4.0),
+        },
+        mesh={
+            "lnscale": (4.0, 6.0),
+            "min_A": (0.02, 0.04),
+            "max_A": (0.04, 0.08),
+        },
+        viscosity_laws=("constant",),
+        eos_types=("ideal",),
+        p_inf_ratio=(0.0, 0.0),
+        log_uniform_keys=("viscosity",),
+        fixed_prandtl=0.71,
+    ),
 }
 
 
@@ -236,7 +307,7 @@ KEY_STATUS_FIELDS = (
     "lnscale", "min_A", "max_A",
     "gamma", "viscosity", "viscosity_law", "power_law_n",
     "eos_type", "p_inf", "p_inf_ratio", "eos_version",
-    "visc_bulk", "thermal_cond", "S_const", "C_v",
+    "visc_bulk", "thermal_cond", "thermal_cond_policy", "Pr", "S_const", "C_v",
     "T_0", "rho_inf", "T_inf", "v_n_inf",
 )
 
@@ -382,6 +453,7 @@ def _generate_fixed_ellipse_mesh(cfg):
     int_edges = []
     bound_edges = []
     edge_tag = []
+    edge_tag_detailed = []
     tol = 1e-10
     for edge, count in sorted(edge_counts.items()):
         if count == 2:
@@ -390,12 +462,22 @@ def _generate_fixed_ellipse_mesh(cfg):
             p0, p1 = points[list(edge)]
             if abs(p0[0] - xmin) < tol and abs(p1[0] - xmin) < tol:
                 tag = "Left"
+                detailed = "Inlet"
             elif abs(p0[0] - xmax) < tol and abs(p1[0] - xmax) < tol:
                 tag = "Right"
+                detailed = "Outlet"
+            elif (
+                (abs(p0[1] - ymin) < tol and abs(p1[1] - ymin) < tol)
+                or (abs(p0[1] - ymax) < tol and abs(p1[1] - ymax) < tol)
+            ):
+                tag = "NavierWall"
+                detailed = "ChannelWall"
             else:
                 tag = "NavierWall"
+                detailed = "ObstacleWall"
             bound_edges.append(edge)
             edge_tag.append(tag)
+            edge_tag_detailed.append(detailed)
         else:
             raise RuntimeError(f"unexpected edge count {count} in fixed_ellipse mesh")
 
@@ -406,6 +488,7 @@ def _generate_fixed_ellipse_mesh(cfg):
         triangles,
         (np.asarray(int_edges, dtype=np.int64), np.asarray(bound_edges, dtype=np.int64)),
         edge_tag,
+        edge_tag_detailed,
     )
 
 
@@ -414,7 +497,7 @@ def _generate_mesh(cfg, params):
         _log("mesh_generation_mode", "fixed_ellipse deterministic one-obstacle channel")
         import torch
         mesh_stuff = _generate_fixed_ellipse_mesh(cfg)
-        Xs, tri_idx, (int_edgs, bound_edgs), edge_tag = mesh_stuff
+        Xs, tri_idx, (int_edgs, bound_edgs), edge_tag, edge_tag_detailed = mesh_stuff
         Xs = torch.from_numpy(Xs).float()
         tri_idx = torch.from_numpy(tri_idx).int()
         int_edgs = torch.from_numpy(int_edgs)
@@ -424,7 +507,7 @@ def _generate_mesh(cfg, params):
             torch.zeros_like(int_edgs[:, 0], dtype=torch.bool),
             torch.ones_like(bound_edgs[:, 0], dtype=torch.bool),
         ], dim=0)
-        return Xs, tri_idx, all_edgs, bc_edge_mask, edge_tag, bound_edgs
+        return Xs, tri_idx, all_edgs, bc_edge_mask, edge_tag, bound_edgs, edge_tag_detailed
     from time_fvm.run_fvm import generate_mesh
     return generate_mesh(cfg)
 
@@ -601,7 +684,11 @@ def _run():
             )
             try:
                 prob = _generate_mesh(cfg, params)
-                Xs, tri_idx, all_edgs, bc_edge_mask, edge_tag, bound_edgs = prob
+                if len(prob) == 7:
+                    Xs, tri_idx, all_edgs, bc_edge_mask, edge_tag, bound_edgs, bc_type_detailed = prob
+                else:
+                    Xs, tri_idx, all_edgs, bc_edge_mask, edge_tag, bound_edgs = prob
+                    bc_type_detailed = None
                 _log(
                     "mesh_generation_success",
                     f"attempt={attempt} cells={len(tri_idx)} edges={len(all_edgs)}",
@@ -635,6 +722,8 @@ def _run():
         _log(stage, "start")
         init_fn = init_conds_ellipses if params['problem'] == 'ellipse' else init_conds_nozzle
         bc_tags, us_init = init_fn(mesh, edge_tag, bound_edgs, phy, cfg)
+        if bc_type_detailed is not None:
+            cfg.bc_type_detailed = list(bc_type_detailed)
         _log(stage, f"end boundary_edges={len(bc_tags)}")
 
         # Re-route the saver's output into our chosen sim_NNNN/ directory.
@@ -748,7 +837,7 @@ MANIFEST_PARAM_KEYS = (
     "family", "geometry_mode", "fixed_geometry_spec", "mesh_seed",
     "gamma", "viscosity", "viscosity_law", "power_law_n",
     "eos_type", "p_inf", "p_inf_ratio", "eos_version",
-    "visc_bulk", "thermal_cond", "S_const", "C_v",
+    "visc_bulk", "thermal_cond", "thermal_cond_policy", "Pr", "S_const", "C_v",
     "T_0", "rho_inf", "T_inf", "v_n_inf", "lnscale", "min_A", "max_A",
 )
 
@@ -798,6 +887,8 @@ def _write_status(out_dir: Path, params: Dict, status: str, *,
         "eos_version": params.get("eos_version"),
         "visc_bulk": params.get("visc_bulk"),
         "thermal_cond": params.get("thermal_cond"),
+        "thermal_cond_policy": params.get("thermal_cond_policy"),
+        "Pr": params.get("Pr"),
         "S_const": params.get("S_const"),
         "C_v": params.get("C_v"),
         "T_0": params.get("T_0"),

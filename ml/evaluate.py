@@ -18,6 +18,7 @@ from .dataset import (
     build_input_features,
     load_grid_record,
     parse_strides,
+    resolve_start_index,
 )
 from .pde import compute_pde_metrics
 
@@ -89,6 +90,11 @@ def _prediction_settings(ckpt: Dict, overrides: argparse.Namespace) -> Dict:
             else bool(_cfg_value(ckpt, "use_derivatives", False))
         ),
         "use_mask_channel": bool(_cfg_value(ckpt, "use_mask_channel", False)),
+        "use_boundary_channels": (
+            overrides.use_boundary_channels
+            if overrides.use_boundary_channels is not None
+            else bool(_cfg_value(ckpt, "use_boundary_channels", False))
+        ),
         "derivative_mode": overrides.derivative_mode or _cfg_value(ckpt, "derivative_mode", "central"),
         "use_physical_derivatives": bool(_cfg_value(ckpt, "use_physical_derivatives", True)),
         "prediction_mode": overrides.prediction_mode or _cfg_value(ckpt, "prediction_mode", "delta"),
@@ -115,21 +121,29 @@ def _predict_next(model, batch: Dict, settings: Dict, device: str):
 
 
 def _rollout_one_file(model, path: str | Path, context: int, steps: int,
-                      temporal_stride: int, settings: Dict, device: str):
+                      temporal_stride: int, settings: Dict, device: str,
+                      start_offset: int = 0, t_start: float | None = None):
     rec = load_grid_record(path)
     states = rec["states"]
     times = rec["times"]
+    start = resolve_start_index(
+        times,
+        times_available=bool(rec.get("times_available", True)),
+        start_offset=start_offset,
+        t_start=t_start,
+        label=Path(path).name,
+    )
     required_last = (context + steps - 1) * temporal_stride
-    if states.shape[0] <= required_last:
+    if states.shape[0] <= start + required_last:
         return None
 
-    context_idx = np.arange(context, dtype=np.int64) * temporal_stride
+    context_idx = start + np.arange(context, dtype=np.int64) * temporal_stride
     context_states = states[context_idx].copy()
     context_times = times[context_idx].copy()
     preds = []
     true = []
     for step in range(steps):
-        target_idx = (context + step) * temporal_stride
+        target_idx = start + (context + step) * temporal_stride
         target_time = float(times[target_idx])
         dt = target_time - float(context_times[-1])
         if not np.isfinite(dt) or dt <= 0:
@@ -143,6 +157,8 @@ def _rollout_one_file(model, path: str | Path, context: int, steps: int,
             use_derivatives=settings["use_derivatives"],
             derivative_mode=settings["derivative_mode"],
             mask=rec["mask"],
+            boundary_mask=rec["boundary_mask"],
+            use_boundary_channels=settings["use_boundary_channels"],
             use_mask_channel=settings["use_mask_channel"],
         )
         features_t = torch.from_numpy(features).unsqueeze(0).to(device)
@@ -168,8 +184,10 @@ def evaluate(grid_dir: str | Path, ckpt_path: str | Path, out_dir: str | Path,
              context: int | None = None, horizon: int | None = None,
              batch_size: int = 4, device: str = "cpu", num_workers: int = 0,
              use_derivatives: bool | None = None, derivative_mode: str | None = None,
+             use_boundary_channels: bool | None = None,
              prediction_mode: str | None = None, integrator: str | None = None,
-             strides: str | None = None, rollout_steps: str = "4,8,16") -> Dict:
+             strides: str | None = None, rollout_steps: str = "4,8,16",
+             start_offset: int = 0, t_start: float | None = None) -> Dict:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     model, ckpt = load_model_from_checkpoint(ckpt_path, device=device)
@@ -180,6 +198,7 @@ def evaluate(grid_dir: str | Path, ckpt_path: str | Path, out_dir: str | Path,
         raise ValueError(HORIZON_ERROR)
     overrides = argparse.Namespace(
         use_derivatives=use_derivatives,
+        use_boundary_channels=use_boundary_channels,
         derivative_mode=derivative_mode,
         prediction_mode=prediction_mode,
         integrator=integrator,
@@ -194,10 +213,16 @@ def evaluate(grid_dir: str | Path, ckpt_path: str | Path, out_dir: str | Path,
         strides=settings["strides"],
         use_derivatives=settings["use_derivatives"],
         derivative_mode=settings["derivative_mode"],
+        use_boundary_channels=settings["use_boundary_channels"],
         use_mask_channel=settings["use_mask_channel"],
+        start_offset=start_offset,
+        t_start=t_start,
     )
     if len(ds) == 0:
-        raise RuntimeError("No evaluation windows. Reduce --context/--horizon/--strides or add snapshots.")
+        raise RuntimeError(
+            "No evaluation windows. Reduce --context/--horizon/--strides, "
+            "lower --start-offset/--t-start, or add snapshots."
+        )
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
     C = model.C
@@ -245,6 +270,8 @@ def evaluate(grid_dir: str | Path, ckpt_path: str | Path, out_dir: str | Path,
                     rolled = _rollout_one_file(
                         model, path, context, steps, temporal_stride,
                         settings, device,
+                        start_offset=start_offset,
+                        t_start=t_start,
                     )
                     if rolled is None:
                         continue
@@ -264,6 +291,8 @@ def evaluate(grid_dir: str | Path, ckpt_path: str | Path, out_dir: str | Path,
         "n_windows": len(ds),
         "context_length": context,
         "prediction_horizon": horizon,
+        "start_offset": int(start_offset),
+        "t_start": t_start,
         "settings": settings,
         "one_step": _finalize(overall),
         "by_stride": {k: _finalize(v) for k, v in sorted(by_stride.items())},
@@ -338,12 +367,19 @@ def main() -> None:
     ap.add_argument("--out", required=True)
     ap.add_argument("--context", type=int, default=None)
     ap.add_argument("--horizon", type=int, default=None)
+    ap.add_argument("--start-offset", type=int, default=0,
+                    help="number of saved snapshots to skip before constructing windows")
+    ap.add_argument("--t-start", type=float, default=None,
+                    help="physical time threshold for the first context frame")
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--num-workers", type=int, default=0)
     ap.add_argument("--use-derivatives", dest="use_derivatives", action="store_true")
     ap.add_argument("--no-derivatives", dest="use_derivatives", action="store_false")
     ap.set_defaults(use_derivatives=None)
+    ap.add_argument("--use-boundary-channels", dest="use_boundary_channels", action="store_true")
+    ap.add_argument("--no-boundary-channels", dest="use_boundary_channels", action="store_false")
+    ap.set_defaults(use_boundary_channels=None)
     ap.add_argument("--derivative-mode", default=None, choices=["central"])
     ap.add_argument("--prediction-mode", default=None, choices=["delta", "derivative"])
     ap.add_argument("--integrator", default=None, choices=["euler"])
@@ -352,17 +388,22 @@ def main() -> None:
     args = ap.parse_args()
     if args.horizon is not None and args.horizon != 1:
         ap.error(HORIZON_ERROR)
+    if args.start_offset < 0:
+        ap.error("--start-offset must be non-negative.")
     try:
         metrics = evaluate(
             args.grid, args.ckpt, args.out, context=args.context,
             horizon=args.horizon, batch_size=args.batch,
             device=args.device, num_workers=args.num_workers,
             use_derivatives=args.use_derivatives,
+            use_boundary_channels=args.use_boundary_channels,
             derivative_mode=args.derivative_mode,
             prediction_mode=args.prediction_mode,
             integrator=args.integrator,
             strides=args.strides,
             rollout_steps=args.rollout_steps,
+            start_offset=args.start_offset,
+            t_start=args.t_start,
         )
     except (RuntimeError, ValueError) as exc:
         raise SystemExit(f"ERROR: {exc}") from exc

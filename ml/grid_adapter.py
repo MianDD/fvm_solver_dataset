@@ -11,8 +11,14 @@ import numpy as np
 from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
 
 try:
+    from .boundary import (
+        BOUNDARY_CLASS_NAMES,
+        BOUNDARY_MASK_VERSION,
+        N_BOUNDARY_CLASSES,
+    )
     from .pde import DEFAULT_PDE_VEC_NAMES, EOS_TYPE_NAMES, VISCOSITY_LAW_NAMES
 except ImportError:  # pragma: no cover - allows direct ``python ml/grid_adapter.py``
+    from boundary import BOUNDARY_CLASS_NAMES, BOUNDARY_MASK_VERSION, N_BOUNDARY_CLASSES
     from pde import DEFAULT_PDE_VEC_NAMES, EOS_TYPE_NAMES, VISCOSITY_LAW_NAMES
 
 
@@ -46,8 +52,8 @@ def load_step(path: str | Path) -> Tuple[float, np.ndarray]:
 
 def load_mesh(path: str | Path) -> Dict:
     """Load ``mesh_props.npz`` and return a dict of arrays."""
-    z = np.load(path)
-    return {
+    z = np.load(path, allow_pickle=True)
+    mesh = {
         "vertices": z["vertices"],         # (n_vert, 2)
         "triangles": z["triangles"],       # (n_cells, 3)
         "centroids": z["centroids"],       # (n_cells, 2)
@@ -55,6 +61,9 @@ def load_mesh(path: str | Path) -> Dict:
         "bc_edge_mask": z["bc_edge_masK"],
         "bc_type_str": z["bc_type_str"],
     }
+    if "bc_type_detailed" in z:
+        mesh["bc_type_detailed"] = z["bc_type_detailed"]
+    return mesh
 
 
 # --------------------------------------------------------------------------
@@ -149,6 +158,128 @@ class GridInterpolator:
         return out.astype(np.float32)
 
 
+def _neighbour_dilation(mask: np.ndarray) -> np.ndarray:
+    """One-cell 8-neighbour dilation implemented with NumPy slices."""
+    src = np.asarray(mask, dtype=bool)
+    out = src.copy()
+    H, W = src.shape
+    for dj in (-1, 0, 1):
+        for di in (-1, 0, 1):
+            if dj == 0 and di == 0:
+                continue
+            src_j0 = max(0, -dj)
+            src_j1 = min(H, H - dj)
+            src_i0 = max(0, -di)
+            src_i1 = min(W, W - di)
+            dst_j0 = max(0, dj)
+            dst_j1 = min(H, H + dj)
+            dst_i0 = max(0, di)
+            dst_i1 = min(W, W + di)
+            out[dst_j0:dst_j1, dst_i0:dst_i1] |= src[src_j0:src_j1, src_i0:src_i1]
+    return out
+
+
+def _outer_boundary_bands(interp: GridInterpolator) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return left/right/channel-wall bands on the regular grid.
+
+    Coordinate-aware thresholds mark roughly two grid layers.  The fallback is
+    the corresponding two edge rows/columns, which keeps old grid files useful
+    even when bbox/coords are unavailable.
+    """
+    H, W = int(interp.H), int(interp.W)
+    left = np.zeros((H, W), dtype=bool)
+    right = np.zeros((H, W), dtype=bool)
+    channel = np.zeros((H, W), dtype=bool)
+    x = getattr(interp, "x_coords", None)
+    y = getattr(interp, "y_coords", None)
+    dx = float(getattr(interp, "dx", 0.0) or 0.0)
+    dy = float(getattr(interp, "dy", 0.0) or 0.0)
+    if x is not None and len(x) >= 2 and dx > 0:
+        x_arr = np.asarray(x, dtype=np.float32)
+        left_cols = x_arr <= (float(x_arr[0]) + 1.5 * dx)
+        right_cols = x_arr >= (float(x_arr[-1]) - 1.5 * dx)
+        left[:, left_cols] = True
+        right[:, right_cols] = True
+    else:
+        left[:, :min(2, W)] = True
+        right[:, max(0, W - 2):] = True
+    if y is not None and len(y) >= 2 and dy > 0:
+        y_arr = np.asarray(y, dtype=np.float32)
+        wall_rows = (y_arr <= (float(y_arr[0]) + 1.5 * dy)) | (
+            y_arr >= (float(y_arr[-1]) - 1.5 * dy)
+        )
+        channel[wall_rows, :] = True
+    else:
+        channel[:min(2, H), :] = True
+        channel[max(0, H - 2):, :] = True
+    return left, right, channel
+
+
+def _normalised_detail_tags(mesh: Dict[str, Any] | None) -> set[str]:
+    if not mesh or "bc_type_detailed" not in mesh:
+        return set()
+    tags = mesh.get("bc_type_detailed")
+    try:
+        values = np.asarray(tags).ravel().tolist()
+    except Exception:
+        return set()
+    return {str(v).lower() for v in values}
+
+
+def compute_boundary_mask(mask: np.ndarray, interp: GridInterpolator,
+                          mesh: Dict[str, Any] | None = None
+                          ) -> Tuple[np.ndarray, List[str], str]:
+    """Build one-hot boundary classes for ML input.
+
+    The saved binary mask remains the source of truth for fluid/non-fluid.  If
+    detailed mesh tags are present, they indicate which physical boundary types
+    exist; rasterisation still uses robust grid geometry so old and new meshes
+    share the same output convention.
+    """
+    fluid = np.asarray(mask, dtype=np.float32) > 0.5
+    if fluid.shape != (int(interp.H), int(interp.W)):
+        raise ValueError(f"mask shape {fluid.shape} does not match grid {(interp.H, interp.W)}")
+    solid = ~fluid
+    tags = _normalised_detail_tags(mesh)
+    use_all_fallback = not tags
+    has_inlet = use_all_fallback or bool({"inlet", "left"} & tags)
+    has_outlet = use_all_fallback or bool({"outlet", "right"} & tags)
+    has_channel = use_all_fallback or bool({"channelwall", "channel_wall"} & tags)
+    has_obstacle = use_all_fallback or bool({"obstaclewall", "obstacle_wall"} & tags)
+
+    left_band, right_band, channel_band = _outer_boundary_bands(interp)
+    outer = left_band | right_band | channel_band
+    adjacent_to_solid = _neighbour_dilation(solid) & fluid
+
+    labels = np.zeros(fluid.shape, dtype=np.int64)
+    labels[solid] = 5
+
+    assigned = solid.copy()
+    if has_inlet:
+        inlet = fluid & left_band & ~assigned
+        labels[inlet] = 1
+        assigned |= inlet
+    if has_outlet:
+        outlet = fluid & right_band & ~assigned
+        labels[outlet] = 2
+        assigned |= outlet
+    if has_channel:
+        channel = fluid & channel_band & ~assigned
+        labels[channel] = 4
+        assigned |= channel
+    if has_obstacle:
+        obstacle = fluid & adjacent_to_solid & ~outer & ~assigned
+        labels[obstacle] = 3
+        assigned |= obstacle
+    interior = fluid & ~assigned
+    labels[interior] = 0
+
+    out = np.zeros((N_BOUNDARY_CLASSES, *fluid.shape), dtype=np.float32)
+    for cls in range(N_BOUNDARY_CLASSES):
+        out[cls] = labels == cls
+    return out, list(BOUNDARY_CLASS_NAMES), BOUNDARY_MASK_VERSION
+
+
 # --------------------------------------------------------------------------
 # Sim-level conversion
 # --------------------------------------------------------------------------
@@ -164,7 +295,9 @@ def _read_json(path: Path) -> Dict[str, Any]:
 def _metadata(sim_dir: Path, cfg: Dict[str, Any], status: Dict[str, Any],
               times: np.ndarray, interp: GridInterpolator,
               mask: np.ndarray,
-              neutral_values: np.ndarray | None = None) -> Dict[str, Any]:
+              neutral_values: np.ndarray | None = None,
+              boundary_mask: np.ndarray | None = None,
+              boundary_mask_source: str = "geometric_fallback") -> Dict[str, Any]:
     """Build portable metadata for the packed grid file."""
     physical = {k: status.get(k, cfg.get(k)) for k in PHYSICAL_KEYS}
     mesh = {k: status.get(k, cfg.get(k)) for k in MESH_KEYS}
@@ -188,6 +321,18 @@ def _metadata(sim_dir: Path, cfg: Dict[str, Any], status: Dict[str, Any],
         "mask_semantics": {
             "0": "solid_or_invalid",
             "1": "fluid",
+        },
+        "boundary_mask": {
+            "version": BOUNDARY_MASK_VERSION,
+            "class_names": list(BOUNDARY_CLASS_NAMES),
+            "shape": (
+                [int(v) for v in boundary_mask.shape]
+                if boundary_mask is not None else None
+            ),
+            "source": boundary_mask_source,
+            "semantics": {
+                str(i): name for i, name in enumerate(BOUNDARY_CLASS_NAMES)
+            },
         },
         "solid_neutralization": {
             "applied": True,
@@ -293,7 +438,10 @@ def neutralize_nonfluid_primitives(snaps: np.ndarray, mask: np.ndarray,
 
 
 def convert_one_sim(sim_dir: Path, grid_H: int = 64, grid_W: int = 96
-                    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict, Dict, GridInterpolator]:
+                    ) -> Tuple[
+                        np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+                        Dict, Dict, GridInterpolator,
+                    ]:
     """Convert all snapshots in ``sim_dir`` to a regular grid.
 
     Returns
@@ -303,11 +451,13 @@ def convert_one_sim(sim_dir: Path, grid_H: int = 64, grid_W: int = 96
     cfg   : dict (the per-sim config that the sweep saved)
     meta  : dict (portable metadata for downstream ML/evaluation)
     mask  : (H, W) binary fluid mask
+    boundary_mask : (6, H, W) one-hot boundary classes
     interp: GridInterpolator with grid coordinates/spacing
     """
     mesh = load_mesh(sim_dir / "mesh_props.npz")
     interp = GridInterpolator(mesh["centroids"], grid_H=grid_H, grid_W=grid_W)
     mask = interp.mesh_mask(mesh["vertices"], mesh["triangles"])
+    boundary_mask, _, _ = compute_boundary_mask(mask, interp, mesh)
 
     t_files = sorted(p for p in sim_dir.iterdir()
                      if p.name.startswith("t_") and p.name.endswith(".npz"))
@@ -326,8 +476,13 @@ def convert_one_sim(sim_dir: Path, grid_H: int = 64, grid_W: int = 96
     times_arr = np.array(times, dtype=np.float32)
     snaps_arr = np.stack(snaps, axis=0)
     snaps_arr, neutral_values = neutralize_nonfluid_primitives(snaps_arr, mask, cfg, status)
-    meta = _metadata(sim_dir, cfg, status, times_arr, interp, mask, neutral_values)
-    return snaps_arr, times_arr, mask, cfg, meta, interp
+    boundary_source = "bc_type_detailed" if "bc_type_detailed" in mesh else "geometric_fallback"
+    meta = _metadata(
+        sim_dir, cfg, status, times_arr, interp, mask, neutral_values,
+        boundary_mask=boundary_mask,
+        boundary_mask_source=boundary_source,
+    )
+    return snaps_arr, times_arr, mask, boundary_mask, cfg, meta, interp
 
 
 def viscosity_law_one_hot(law: str | None) -> np.ndarray:
@@ -433,7 +588,7 @@ def assemble_dataset(sweep_dir: str | Path, out_dir: str | Path,
             skipped[skip_reason] = skipped.get(skip_reason, 0) + 1
             print(f"  SKIP {sd.name}: {skip_reason}")
             continue
-        snaps, times, mask, cfg, meta, interp = convert_one_sim(sd, grid_H=grid_H, grid_W=grid_W)
+        snaps, times, mask, boundary_mask, cfg, meta, interp = convert_one_sim(sd, grid_H=grid_H, grid_W=grid_W)
         if not np.all(np.isfinite(snaps)):
             skip_reason = "non-finite values after interp"
             skipped[skip_reason] = skipped.get(skip_reason, 0) + 1
@@ -445,6 +600,10 @@ def assemble_dataset(sweep_dir: str | Path, out_dir: str | Path,
             states=snaps.astype(np.float32),
             snapshots=snaps.astype(np.float32),
             mask=mask.astype(np.float32),
+            boundary_mask=boundary_mask.astype(np.float32),
+            boundary_class_names=np.array(BOUNDARY_CLASS_NAMES),
+            boundary_mask_version=np.array(BOUNDARY_MASK_VERSION),
+            boundary_mask_shape=np.array(boundary_mask.shape, dtype=np.int32),
             times=times,
             channel_names=np.array(CHANNEL_NAMES),
             x_coords=interp.x_coords,

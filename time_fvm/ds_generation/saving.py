@@ -31,9 +31,14 @@ class Saver:
         bc_midpoints = mesh.midpoints[bc_edge_mask].numpy()     # shape = [n_bc_edge, 2]
         bc_normals = mesh.normals[bc_edge_mask].numpy()         # shape = [n_bc_edge, 2]
         bc_type_str = E_props.bc_type_str                       # shape = [n_bc_edge]
+        bc_type_detailed = getattr(getattr(E_props, "cfg", None), "bc_type_detailed", None)
+        if bc_type_detailed is not None and len(bc_type_detailed) != len(bc_type_str):
+            bc_type_detailed = None
         mesh_props = {"triangles": triangles, "vertices": vertices, "centroids": centroids, "edges": edges,
                       "bc_midpoints": bc_midpoints, "bc_normals": bc_normals,
-                      "bc_edge_masK": bc_edge_mask, "bc_type_str": bc_type_str}
+                      "bc_edge_masK": bc_edge_mask, "bc_type_str": np.asarray(bc_type_str, dtype=str)}
+        if bc_type_detailed is not None:
+            mesh_props["bc_type_detailed"] = np.asarray(bc_type_detailed, dtype=str)
         np.savez_compressed(f'{self.save_dir}/mesh_props.npz', **mesh_props)
         c_print(f"Saved mesh properties to '{self.save_dir}/mesh_props.npz'", color="green")
 

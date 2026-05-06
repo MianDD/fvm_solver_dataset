@@ -17,9 +17,12 @@ from typing import Dict, Iterable, List
 PARAM_KEYS = [
     "gamma", "viscosity", "visc_bulk", "thermal_cond", "S_const", "C_v",
     "T_0", "rho_inf", "T_inf", "v_n_inf", "lnscale", "min_A", "max_A",
-    "power_law_n", "p_inf", "p_inf_ratio",
+    "power_law_n", "p_inf", "p_inf_ratio", "Pr",
 ]
-CATEGORICAL_KEYS = ["family", "viscosity_law", "eos_type", "eos_version"]
+CATEGORICAL_KEYS = [
+    "family", "viscosity_law", "eos_type", "eos_version",
+    "thermal_cond_policy",
+]
 
 
 def _snapshot_count(sim_dir: Path) -> int:

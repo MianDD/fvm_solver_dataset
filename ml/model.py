@@ -275,7 +275,11 @@ class FoundationCFDModel(nn.Module):
                  n_layers: int = 4, max_context: int = 8, dropout: float = 0.0,
                  mlp_ratio: float = 4.0, attention_type: str = "global",
                  pos_encoding: str = "learned_absolute",
-                 pde_dim: int = 0):
+                 pde_dim: int = 0,
+                 use_boundary_channels: bool = False,
+                 boundary_channels: int = 6,
+                 boundary_aware_refine: bool = False,
+                 boundary_channel_start: int | None = None):
         super().__init__()
         if attention_type not in ATTENTION_TYPES:
             allowed = ", ".join(repr(name) for name in ATTENTION_TYPES)
@@ -306,6 +310,31 @@ class FoundationCFDModel(nn.Module):
         self.attention_type = attention_type
         self.pos_encoding = pos_encoding
         self.pde_dim = int(pde_dim or 0)
+        self.use_boundary_channels = bool(use_boundary_channels)
+        self.boundary_channels = int(boundary_channels)
+        self.boundary_aware_refine = bool(boundary_aware_refine)
+        self.boundary_channel_start = (
+            None if boundary_channel_start is None else int(boundary_channel_start)
+        )
+        if self.boundary_channels <= 0:
+            raise ValueError(f"boundary_channels must be positive; got {self.boundary_channels}.")
+        if self.boundary_aware_refine:
+            if not self.use_boundary_channels:
+                raise ValueError("boundary_aware_refine requires use_boundary_channels=True.")
+            if self.boundary_channel_start is None:
+                raise ValueError(
+                    "boundary_aware_refine requires boundary_channel_start so the "
+                    "model can extract the static one-hot boundary mask."
+                )
+            if not (0 <= self.boundary_channel_start < self.C_in):
+                raise ValueError(
+                    f"boundary_channel_start={self.boundary_channel_start} outside C_in={self.C_in}."
+                )
+            if self.boundary_channel_start + self.boundary_channels > self.C_in:
+                raise ValueError(
+                    "boundary channels exceed input channel count: "
+                    f"start={self.boundary_channel_start}, count={self.boundary_channels}, C_in={self.C_in}."
+                )
 
         self.normaliser = ChannelNormaliser(self.C_in)
 
@@ -336,11 +365,16 @@ class FoundationCFDModel(nn.Module):
             nn.Linear(d_model, d_model), nn.GELU(),
             nn.Linear(d_model, patch_dim_out),
         )
-        # Lightweight CNN refinement smooths patch boundaries
+        # Deeper post-patch CNN refinement reduces patch-boundary artefacts.
+        # In boundary-aware mode, the final context-step one-hot boundary mask
+        # is concatenated to the decoded update before refinement.
+        refine_in_channels = self.C + (self.boundary_channels if self.boundary_aware_refine else 0)
         self.refine = nn.Sequential(
-            nn.Conv2d(self.C, 32, 3, padding=1), nn.GELU(),
-            nn.Conv2d(32, 32, 3, padding=1),         nn.GELU(),
-            nn.Conv2d(32, self.C, 3, padding=1),
+            nn.Conv2d(refine_in_channels, 64, kernel_size=5, padding=2), nn.GELU(),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1), nn.GELU(),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1), nn.GELU(),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1), nn.GELU(),
+            nn.Conv2d(64, self.C, kernel_size=3, padding=1),
         )
         self.pde_head = (
             nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, self.pde_dim))
@@ -433,7 +467,19 @@ class FoundationCFDModel(nn.Module):
         out_tau = 1
         patches = self.patch_decoder(flat)
         delta = from_patches(patches, self.C, H, W, self.P)
-        delta = delta + self.refine(delta)
+        if self.boundary_aware_refine:
+            start = int(self.boundary_channel_start)
+            end = start + self.boundary_channels
+            boundary = states[:, -1, start:end].to(dtype=delta.dtype, device=delta.device)
+            if boundary.shape[-2:] != delta.shape[-2:]:
+                raise ValueError(
+                    f"boundary mask grid {tuple(boundary.shape[-2:])} does not match "
+                    f"decoded update grid {tuple(delta.shape[-2:])}."
+                )
+            refine_input = torch.cat([delta, boundary], dim=1)
+        else:
+            refine_input = delta
+        delta = delta + self.refine(refine_input)
         update = delta.reshape(B, out_tau, self.C, H, W)
         pde_pred = self.pde_head(out.mean(dim=(1, 2))) if self.pde_head is not None else None
         return update, pde_pred

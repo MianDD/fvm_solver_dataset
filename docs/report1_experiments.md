@@ -8,6 +8,7 @@ It assumes the repository is already patched with:
 - ID/OOD family sampling with 17D `pde_vec`;
 - grid-mask neutralisation of non-fluid pixels;
 - mask-aware training normalisation and raw binary mask channel;
+- optional six-channel boundary-condition masks for ML inputs;
 - global attention decoding only the final context token.
 
 The goal for Report 1 is to demonstrate a foundation-model-style CFD pipeline
@@ -43,6 +44,27 @@ Family sampling is implemented in `sweep/sweep_fvm.py`.
 - `p_inf_ratio in [0.08, 0.20]`
 - viscosity laws: `constant`, `power_law`
 - intended use: stress-test OOD evaluation
+
+`id_visc_only`:
+
+- EOS: ideal gas only
+- `p_inf = 0`, `p_inf_ratio = 0`
+- viscosity law: `constant`
+- fixed state: `gamma=1.4`, `C_v=2.5`, `T_0=100`,
+  `rho_inf=1`, `T_inf=100`, `v_n_inf=4`
+- `visc_bulk = 0`
+- `viscosity` is sampled log-uniformly over `[1e-3, 5e-3]`
+- `thermal_cond = viscosity * cp / Pr`, with `cp = gamma * C_v`
+  and `Pr = 0.71`
+- intended use: focused ID study of how shear viscosity affects late-stage
+  roll-up behind a fixed obstacle
+
+`ood_visc_only`:
+
+- same fixed ideal-gas state and fixed-Prandtl policy as `id_visc_only`
+- `viscosity` is sampled log-uniformly over `[5e-3, 2e-2]`
+- intended use: disjoint higher-viscosity OOD test for the focused roll-up
+  study
 
 For stiffened gas, the sampler computes:
 
@@ -123,6 +145,49 @@ During training, if masks are present:
 For ellipse/obstacle datasets, use both `--use-mask-channel` and `--mask-loss`
 unless you are deliberately running an ablation.
 
+New gridded files can also contain `boundary_mask` with shape `(6, H, W)`.
+It is a one-hot raster used only by the ML input pipeline:
+
+```text
+0 = fluid_interior
+1 = inlet
+2 = outlet
+3 = obstacle_wall
+4 = channel_wall
+5 = solid
+```
+
+The solver-facing boundary tags are unchanged. For fixed-ellipse raw data,
+the sweep writes detailed mesh tags such as `Inlet`, `Outlet`,
+`ObstacleWall`, and `ChannelWall`; otherwise the grid adapter falls back to a
+geometric rule using the fluid mask and the grid coordinates. Enable these
+channels with `--use-boundary-channels`. Input channels are ordered as:
+
+```text
+physical [V_x,V_y,rho,T]
+then optional derivative channels
+then optional boundary one-hot channels
+then optional legacy binary fluid mask channel
+```
+
+Boundary channels are kept as raw `0/1` features: they are not z-score
+normalised and receive no training input noise. Old gridded datasets without
+`boundary_mask` still load, but only a minimal fluid/solid default is available;
+regenerate grids when you want inlet/outlet/wall information.
+
+Two optional boundary-focused training refinements are available for the wall
+roll-up experiments:
+
+- `--boundary-loss-weight 0.5` adds an extra prediction loss over inlet,
+  outlet, obstacle-wall, and channel-wall fluid pixels. Solid pixels are never
+  included.
+- `--boundary-aware-refine` lets the post-patch CNN refinement head see the
+  final context-step six-channel boundary mask by concatenating it with the
+  decoded update before refinement.
+
+Both are off by default. Use them as controlled ablations rather than silently
+mixing them into every baseline.
+
 ## Recommended Execution Order
 
 1. Run smoke tests.
@@ -148,7 +213,10 @@ Run these before large jobs:
 .\.venv\Scripts\python.exe -m ml.smoke_report1
 .\.venv\Scripts\python.exe -m ml.smoke_masked_normalization
 .\.venv\Scripts\python.exe -m ml.smoke_grid_mask
+.\.venv\Scripts\python.exe -m ml.smoke_boundary_mask
+.\.venv\Scripts\python.exe -m ml.smoke_plot_fields
 .\.venv\Scripts\python.exe -m sweep.smoke_family_sampling
+.\.venv\Scripts\python.exe -m sweep.smoke_visc_only_family
 .\.venv\Scripts\python.exe -m time_fvm.smoke_eos
 .\.venv\Scripts\python.exe -m time_fvm.smoke_viscosity
 ```
@@ -188,7 +256,7 @@ Remove-Item -Recurse -Force figures\report1\smoke_factorized -ErrorAction Silent
   --attention-type factorized --pos-encoding sinusoidal `
   --prediction-mode derivative --integrator euler `
   --use-derivatives --derivative-mode central --strides 1 `
-  --use-mask-channel --mask-loss `
+  --use-boundary-channels --use-mask-channel --mask-loss `
   --pde-aux-loss --pde-normalize --pde-log-transport `
   --pde-cont-loss huber --pde-aux-weight 0.01
 
@@ -285,6 +353,177 @@ set.
 Use `--n 200` and output `datasets\raw\report1_ood_hard_200` for a larger OOD
 set.
 
+## Viscosity-Only Focused Experiments
+
+These commands support the focused Report 1 feedback question:
+
+```text
+How does shear viscosity affect late-stage roll-up behind a fixed obstacle?
+```
+
+Use `--geometry-mode fixed_ellipse` so geometry is held fixed while only shear
+viscosity varies. These families are low-Mach ideal-gas sweeps, so use
+`--max-mach 5` as a stricter validation threshold than the general default.
+For long trajectories with `--save-t 0.3`, the supervisor feedback is to train
+and evaluate on the later roll-up stage rather than the first transient seconds.
+Use `--t-start 2.0` in `ml.train`, `ml.evaluate`, and `ml.plot_predictions`;
+this is approximately equivalent to `--start-offset 7` because `2.0 / 0.3`
+rounds up to saved-frame index 7. Prefer `--t-start` when saved `times`
+exist, and use `--start-offset 7` only for older gridded files without physical
+times. Make sure the chosen `--t-start` matches the actual saved physical time
+scale for the run.
+
+### Viscosity-Only Smoke, N=3
+
+```powershell
+.\.venv\Scripts\python.exe -m sweep.sweep_fvm --out datasets\raw\report1_visc_only_smoke_id3 `
+  --n 3 --family id_visc_only --geometry-mode fixed_ellipse --device cpu `
+  --n-iter 80 --save-t 0.0025 --dt 5e-4 `
+  --min-A 0.2 --max-A 0.4 --lnscale 3 `
+  --max-mesh-retries 2 --mesh-attempt-timeout-s 30 --timeout-s 300 `
+  --min-snapshots 4 --validate-physics --max-mach 5
+```
+
+### Viscosity-Only ID20 Debug
+
+```powershell
+.\.venv\Scripts\python.exe -m sweep.sweep_fvm --out datasets\raw\report1_visc_only_id_20 `
+  --n 20 --family id_visc_only --geometry-mode fixed_ellipse --device cpu `
+  --n-iter 500 --save-t 0.01 --dt 5e-4 `
+  --min-A 0.2 --max-A 0.4 --lnscale 3 `
+  --max-mesh-retries 2 --mesh-attempt-timeout-s 30 --timeout-s 900 `
+  --min-snapshots 10 --validate-physics --max-mach 5
+```
+
+### Viscosity-Only ID200 Main
+
+```powershell
+.\.venv\Scripts\python.exe -m sweep.sweep_fvm --out datasets\raw\report1_visc_only_id_200 `
+  --n 200 --family id_visc_only --geometry-mode fixed_ellipse --device cpu `
+  --n-iter 500 --save-t 0.01 --dt 5e-4 `
+  --min-A 0.2 --max-A 0.4 --lnscale 3 `
+  --max-mesh-retries 2 --mesh-attempt-timeout-s 30 --timeout-s 900 `
+  --min-snapshots 10 --validate-physics --max-mach 5
+```
+
+### Viscosity-Only OOD100
+
+```powershell
+.\.venv\Scripts\python.exe -m sweep.sweep_fvm --out datasets\raw\report1_visc_only_ood_100 `
+  --n 100 --family ood_visc_only --geometry-mode fixed_ellipse --device cpu `
+  --n-iter 500 --save-t 0.01 --dt 5e-4 `
+  --min-A 0.2 --max-A 0.4 --lnscale 3 `
+  --max-mesh-retries 2 --mesh-attempt-timeout-s 30 --timeout-s 900 `
+  --min-snapshots 10 --validate-physics --max-mach 5
+```
+
+Grid conversion follows the same convention as the main datasets:
+
+```powershell
+.\.venv\Scripts\python.exe -m ml.grid_adapter --sweep datasets\raw\report1_visc_only_id_20 `
+  --out datasets\gridded\report1_visc_only_id_20 --H 64 --W 96
+
+.\.venv\Scripts\python.exe -m ml.grid_adapter --sweep datasets\raw\report1_visc_only_id_200 `
+  --out datasets\gridded\report1_visc_only_id_200 --H 64 --W 96
+
+.\.venv\Scripts\python.exe -m ml.grid_adapter --sweep datasets\raw\report1_visc_only_ood_100 `
+  --out datasets\gridded\report1_visc_only_ood_100 --H 64 --W 96
+```
+
+Later-stage training/evaluation on long viscosity-only trajectories:
+
+```powershell
+.\.venv\Scripts\python.exe -m ml.train `
+  --grid datasets\gridded\report1_visc_only_id_200 `
+  --out checkpoints\report1\visc_only_id200_factorized_late `
+  --epochs 10 --batch 4 --context 4 --horizon 1 --device cpu `
+  --d-model 128 --heads 4 --layers 4 --patch 8 `
+  --attention-type factorized --pos-encoding sinusoidal `
+  --prediction-mode derivative --integrator euler `
+  --use-derivatives --use-boundary-channels --use-mask-channel --mask-loss `
+  --pde-aux-loss --pde-normalize --pde-log-transport `
+  --pde-cont-loss huber --t-start 2.0
+
+.\.venv\Scripts\python.exe -m ml.evaluate `
+  --grid datasets\gridded\report1_visc_only_id_200 `
+  --ckpt checkpoints\report1\visc_only_id200_factorized_late\best_model.pt `
+  --out eval\report1\visc_only_id200_late `
+  --context 4 --horizon 1 --batch 4 --device cpu --t-start 2.0
+
+.\.venv\Scripts\python.exe -m ml.plot_predictions `
+  --grid datasets\gridded\report1_visc_only_id_200 `
+  --ckpt checkpoints\report1\visc_only_id200_factorized_late\best_model.pt `
+  --out figures\report1\predictions\visc_only_id200_late `
+  --context 4 --horizon 1 --stride 1 --num-examples 4 --device cpu --t-start 2.0
+```
+
+### Viscosity-Only Boundary Variants
+
+Use the same ID/OOD grids and late-stage filtering so the comparison isolates
+the boundary-aware choices:
+
+A. Baseline, no detailed boundary channels:
+
+```powershell
+.\.venv\Scripts\python.exe -m ml.train `
+  --grid datasets\gridded\report1_visc_only_id_200 `
+  --out checkpoints\report1\visc_only_A_baseline `
+  --epochs 10 --batch 4 --context 4 --horizon 1 --device cpu `
+  --d-model 128 --heads 4 --layers 4 --patch 8 `
+  --attention-type factorized --pos-encoding sinusoidal `
+  --prediction-mode derivative --integrator euler `
+  --use-derivatives --use-mask-channel --mask-loss `
+  --pde-aux-loss --pde-normalize --pde-log-transport `
+  --pde-cont-loss huber --t-start 2.0
+```
+
+B. Add boundary one-hot channels:
+
+```powershell
+.\.venv\Scripts\python.exe -m ml.train `
+  --grid datasets\gridded\report1_visc_only_id_200 `
+  --out checkpoints\report1\visc_only_B_boundary_channels `
+  --epochs 10 --batch 4 --context 4 --horizon 1 --device cpu `
+  --d-model 128 --heads 4 --layers 4 --patch 8 `
+  --attention-type factorized --pos-encoding sinusoidal `
+  --prediction-mode derivative --integrator euler `
+  --use-derivatives --use-boundary-channels --use-mask-channel --mask-loss `
+  --pde-aux-loss --pde-normalize --pde-log-transport `
+  --pde-cont-loss huber --t-start 2.0
+```
+
+C. Add boundary-weighted loss:
+
+```powershell
+.\.venv\Scripts\python.exe -m ml.train `
+  --grid datasets\gridded\report1_visc_only_id_200 `
+  --out checkpoints\report1\visc_only_C_boundary_loss `
+  --epochs 10 --batch 4 --context 4 --horizon 1 --device cpu `
+  --d-model 128 --heads 4 --layers 4 --patch 8 `
+  --attention-type factorized --pos-encoding sinusoidal `
+  --prediction-mode derivative --integrator euler `
+  --use-derivatives --use-boundary-channels --use-mask-channel --mask-loss `
+  --boundary-loss-weight 0.5 `
+  --pde-aux-loss --pde-normalize --pde-log-transport `
+  --pde-cont-loss huber --t-start 2.0
+```
+
+D. Add boundary-aware refinement:
+
+```powershell
+.\.venv\Scripts\python.exe -m ml.train `
+  --grid datasets\gridded\report1_visc_only_id_200 `
+  --out checkpoints\report1\visc_only_D_boundary_refine `
+  --epochs 10 --batch 4 --context 4 --horizon 1 --device cpu `
+  --d-model 128 --heads 4 --layers 4 --patch 8 `
+  --attention-type factorized --pos-encoding sinusoidal `
+  --prediction-mode derivative --integrator euler `
+  --use-derivatives --use-boundary-channels --use-mask-channel --mask-loss `
+  --boundary-loss-weight 0.5 --boundary-aware-refine `
+  --pde-aux-loss --pde-normalize --pde-log-transport `
+  --pde-cont-loss huber --t-start 2.0
+```
+
 Summarize each raw dataset:
 
 ```powershell
@@ -317,6 +556,12 @@ Skip the ID1000 command until that optional raw dataset exists.
 
 ## Main Report 1 Training Commands
 
+New experiments use a deeper post-patch CNN refinement head after the
+Transformer patch decoder. It is still a post-processing refinement of the
+predicted update field, not a CNN stem before attention. Checkpoints created
+before this refinement-head change may not load because the `refine` layer
+shapes differ; keep old and new experiment folders separate.
+
 ### ID20 Debug Model
 
 ```powershell
@@ -328,7 +573,7 @@ Skip the ID1000 command until that optional raw dataset exists.
   --attention-type factorized --pos-encoding sinusoidal `
   --prediction-mode derivative --integrator euler `
   --use-derivatives --derivative-mode central --strides 1,2,4 `
-  --use-mask-channel --mask-loss `
+  --use-boundary-channels --use-mask-channel --mask-loss `
   --pde-aux-loss --pde-normalize --pde-log-transport `
   --pde-cont-loss huber --pde-aux-weight 0.01 `
   --pde-cont-weight 1.0 --pde-law-weight 1.0 --pde-eos-weight 1.0 `
@@ -346,7 +591,7 @@ Skip the ID1000 command until that optional raw dataset exists.
   --attention-type factorized --pos-encoding sinusoidal `
   --prediction-mode derivative --integrator euler `
   --use-derivatives --derivative-mode central --strides 1,2,4 `
-  --use-mask-channel --mask-loss `
+  --use-boundary-channels --use-mask-channel --mask-loss `
   --pde-aux-loss --pde-normalize --pde-log-transport `
   --pde-cont-loss huber --pde-aux-weight 0.01 `
   --pde-cont-weight 1.0 --pde-law-weight 1.0 --pde-eos-weight 1.0 `
@@ -550,11 +795,54 @@ whose names do not contain `ablat`. Folders containing `ablat` are collected in
   --grid datasets\gridded\report1_id_200 `
   --ckpt checkpoints\report1\id200_factorized_derivative_pde\best_model.pt `
   --out figures\report1\id200_predictions `
-  --context 4 --horizon 1 --stride 1 --num-examples 4 --device cpu
+  --context 4 --horizon 1 --stride 1 --num-examples 4 --device cpu `
+  --dpi 300 --fig-scale 1.25
 ```
 
-This produces PNG comparisons for fields such as `rho`, velocity magnitude,
-prediction, target, and absolute error maps.
+This produces high-DPI PNG comparisons for context, target, prediction, and
+absolute error. Omitting `--field` preserves the legacy `rho` and velocity
+magnitude outputs. For Report 1 roll-up figures, prefer additional physical
+fields:
+
+```powershell
+.\.venv\Scripts\python.exe -m ml.plot_predictions `
+  --grid datasets\gridded\report1_visc_only_id_200 `
+  --ckpt checkpoints\report1\visc_only_id200_factorized_late\best_model.pt `
+  --out figures\report1\predictions\visc_only_selected_vorticity `
+  --context 4 --horizon 1 --stride 1 --device cpu `
+  --field vorticity --sim-ids "42,1157,1614" --t-start 2.0 `
+  --max-plots 6 --dpi 350 --fig-scale 1.3 --save-pdf
+
+.\.venv\Scripts\python.exe -m ml.plot_predictions `
+  --grid datasets\gridded\report1_visc_only_id_200 `
+  --ckpt checkpoints\report1\visc_only_id200_factorized_late\best_model.pt `
+  --out figures\report1\predictions\visc_only_selected_schlieren `
+  --context 4 --horizon 1 --stride 1 --device cpu `
+  --field schlieren --sim-ids "42,1157,1614" --t-start 2.0 `
+  --max-plots 6 --dpi 350 --fig-scale 1.3 --save-pdf
+```
+
+Supported prediction fields are `rho`, `T`, `V_x`, `V_y`, `vorticity`,
+`grad_rho`, and `schlieren`. Vorticity and density-gradient/schlieren fields
+are derived from primitive gridded states for visualisation only; they are not
+training targets, losses, or evaluation metrics.
+
+For pure saved-simulation figures without a model checkpoint, use
+`ml.plot_fields`:
+
+```powershell
+.\.venv\Scripts\python.exe -m ml.plot_fields `
+  --grid datasets\gridded\report1_visc_only_id_200 `
+  --out figures\report1\fields\visc_only_vorticity `
+  --field vorticity --sim-ids "42,1157,1614" --time-indices 7,10,15 `
+  --dpi 350 --fig-scale 1.25 --save-pdf
+
+.\.venv\Scripts\python.exe -m ml.plot_fields `
+  --grid datasets\gridded\report1_visc_only_id_200 `
+  --out figures\report1\fields\visc_only_schlieren_last `
+  --field schlieren --sim-ids "42,1157,1614" --last `
+  --dpi 350 --fig-scale 1.25 --save-pdf
+```
 
 ### PDE Metrics, Confusion Matrices, And Rollout Figures
 
@@ -642,10 +930,12 @@ document or keep the CSD3 outputs clearly separate and record the mapping.
 - Do not mix old 16D and new 17D gridded datasets in one training directory.
 - Always use `--geometry-mode fixed_ellipse` for stable CSD3 dataset generation
   unless you intentionally want random-geometry stress tests.
-- Always use `--use-mask-channel --mask-loss` for ellipse/obstacle datasets
-  unless running a mask ablation.
+- Use `--use-boundary-channels --use-mask-channel --mask-loss` for the main
+  ellipse/obstacle experiments unless running a boundary/mask ablation.
 - Use `--attention-type factorized` for the main scalable model and
   `--attention-type global` only as a baseline/ablation.
+- Do not mix pre-refinement-head checkpoints with new experiments; the deeper
+  post-patch CNN changes `refine` layer shapes.
 - ID-only law/EOS classification accuracy is degenerate. Use mixed/OOD data for
   meaningful PDE-form identification claims.
 - Generated data, checkpoints, eval outputs, and figures must not be committed.

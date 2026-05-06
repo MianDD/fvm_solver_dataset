@@ -13,6 +13,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
+from .boundary import BOUNDARY_CLASS_NAMES
 from .dataset import (
     CFDWindowDataset,
     TARGET_CHANNEL_NAMES,
@@ -38,6 +39,8 @@ class TrainConfig:
     out_dir: str = "checkpoints/run0"
     context_length: int = 4
     prediction_horizon: int = 1
+    start_offset: int = 0
+    t_start: float | None = None
     batch_size: int = 4
     lr: float = 3e-4
     weight_decay: float = 1e-5
@@ -57,6 +60,9 @@ class TrainConfig:
     rollout_train_steps: int = 1
     rollout_train_weight_decay: float = 1.0
     pos_encoding: str = "learned_absolute"
+    use_boundary_channels: bool = False
+    boundary_aware_refine: bool = False
+    boundary_loss_weight: float = 0.0
     use_mask_channel: bool = False
     mask_loss: bool = False
     pde_aux_loss: bool = False
@@ -107,6 +113,21 @@ def weighted_masked_mse(pred: torch.Tensor, true: torch.Tensor,
     return (err * mask).sum() / denom.clamp_min(1.0)
 
 
+def boundary_fluid_mask(batch: Dict, device: str | torch.device) -> torch.Tensor | None:
+    """Return inlet/outlet/obstacle/channel-wall pixels, excluding solid."""
+    boundary = batch.get("boundary_mask")
+    if boundary is None:
+        return None
+    boundary = boundary.to(device=device)
+    if boundary.dim() == 3:
+        boundary = boundary.unsqueeze(0)
+    if boundary.dim() != 4 or boundary.shape[1] < 6:
+        return None
+    region = boundary[:, 1:5].sum(dim=1)
+    solid = boundary[:, 5]
+    return ((region > 0.5) & (solid <= 0.5)).to(dtype=torch.float32)
+
+
 def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -119,12 +140,33 @@ def _input_channel_names(use_derivatives: bool) -> List[str]:
 
 
 def _configured_input_channel_names(cfg: TrainConfig) -> List[str]:
-    return input_channel_names(cfg.use_derivatives, cfg.use_mask_channel, TARGET_CHANNEL_NAMES)
+    return input_channel_names(
+        cfg.use_derivatives,
+        cfg.use_mask_channel,
+        TARGET_CHANNEL_NAMES,
+        use_boundary_channels=cfg.use_boundary_channels,
+    )
+
+
+def input_raw_channel_indices(cfg: TrainConfig, n_channels: int) -> List[int]:
+    names = _configured_input_channel_names(cfg)[:n_channels]
+    raw = [i for i, name in enumerate(names) if str(name).startswith("boundary_")]
+    if cfg.use_mask_channel:
+        raw.append(n_channels - 1)
+    return sorted({int(i) for i in raw if 0 <= int(i) < n_channels})
+
+
+def configured_boundary_channel_indices(cfg: TrainConfig) -> List[int]:
+    return [
+        i for i, name in enumerate(_configured_input_channel_names(cfg))
+        if str(name).startswith("boundary_")
+    ]
 
 
 def compute_channel_stats(loader: DataLoader, n_channels: int,
                           use_fluid_mask: bool = False,
-                          mask_channel_index: int | None = None
+                          mask_channel_index: int | None = None,
+                          raw_channel_indices: List[int] | None = None,
                           ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute input-channel statistics, optionally over fluid cells only.
 
@@ -139,6 +181,12 @@ def compute_channel_stats(loader: DataLoader, n_channels: int,
     mask_idx = None if mask_channel_index is None else int(mask_channel_index)
     if mask_idx is not None and not (0 <= mask_idx < n_channels):
         raise ValueError(f"mask_channel_index={mask_idx} outside n_channels={n_channels}")
+    raw_indices = {int(i) for i in (raw_channel_indices or [])}
+    if mask_idx is not None:
+        raw_indices.add(mask_idx)
+    bad_raw = [i for i in raw_indices if not (0 <= i < n_channels)]
+    if bad_raw:
+        raise ValueError(f"raw_channel_indices={bad_raw} outside n_channels={n_channels}")
     with torch.no_grad():
         for batch in loader:
             x = batch["input_states"]                    # (B, context, C_in, H, W)
@@ -153,7 +201,7 @@ def compute_channel_stats(loader: DataLoader, n_channels: int,
                     raise ValueError(f"mask shape {tuple(mask.shape)} does not match batch grid {(x.shape[0], H, W)}")
                 weights = mask[:, None, None, :, :].expand(-1, x.shape[1], 1, -1, -1)
                 for ch in range(C):
-                    if ch == mask_idx:
+                    if ch in raw_indices:
                         continue
                     values = x[:, :, ch:ch + 1, :, :]
                     sums[ch] += (values * weights).sum()
@@ -164,16 +212,16 @@ def compute_channel_stats(loader: DataLoader, n_channels: int,
                 sums += xx.sum(dim=(0, 2))
                 sums2 += (xx ** 2).sum(dim=(0, 2))
                 counts += xx.shape[0] * xx.shape[2]
-    if mask_idx is not None:
-        sums[mask_idx] = 0.0
-        sums2[mask_idx] = 0.0
-        counts[mask_idx] = 1.0
+    for idx in raw_indices:
+        sums[idx] = 0.0
+        sums2[idx] = 0.0
+        counts[idx] = 1.0
     safe_counts = counts.clamp_min(1.0)
     mean = sums / safe_counts
     var = (sums2 / safe_counts - mean ** 2).clamp_min(1e-6)
-    if mask_idx is not None:
-        mean[mask_idx] = 0.0
-        var[mask_idx] = 1.0
+    for idx in raw_indices:
+        mean[idx] = 0.0
+        var[idx] = 1.0
     return mean, var.sqrt()
 
 
@@ -183,6 +231,9 @@ def make_model(cfg: TrainConfig, C_in: int, H: int, W: int) -> FoundationCFDMode
             "Only --patch-t 1 is implemented in this incremental pass. "
             "Temporal tubelets with patch_t>1 require a decoder reshape change."
         )
+    boundary_indices = configured_boundary_channel_indices(cfg)
+    if cfg.boundary_aware_refine and not boundary_indices:
+        raise RuntimeError("--boundary-aware-refine requires --use-boundary-channels.")
     return FoundationCFDModel(
         n_channels=len(TARGET_CHANNEL_NAMES),
         n_input_channels=C_in,
@@ -199,6 +250,10 @@ def make_model(cfg: TrainConfig, C_in: int, H: int, W: int) -> FoundationCFDMode
         attention_type=cfg.attention_type,
         pos_encoding=cfg.pos_encoding,
         pde_dim=cfg.pde_dim if cfg.pde_aux_loss else 0,
+        use_boundary_channels=cfg.use_boundary_channels,
+        boundary_channels=len(BOUNDARY_CLASS_NAMES),
+        boundary_aware_refine=cfg.boundary_aware_refine,
+        boundary_channel_start=(boundary_indices[0] if boundary_indices else None),
     )
 
 
@@ -225,6 +280,11 @@ def model_config_dict(cfg: TrainConfig, C_in: int, H: int, W: int) -> Dict:
         "input_channel_names": _configured_input_channel_names(cfg),
         "target_channel_names": TARGET_CHANNEL_NAMES,
         "use_derivatives": cfg.use_derivatives,
+        "use_boundary_channels": cfg.use_boundary_channels,
+        "boundary_channels": len(BOUNDARY_CLASS_NAMES),
+        "boundary_aware_refine": cfg.boundary_aware_refine,
+        "boundary_loss_weight": cfg.boundary_loss_weight,
+        "boundary_class_names": list(BOUNDARY_CLASS_NAMES),
         "use_mask_channel": cfg.use_mask_channel,
         "mask_loss": cfg.mask_loss,
         "derivative_mode": cfg.derivative_mode,
@@ -362,6 +422,9 @@ def save_checkpoint(path: Path, model: FoundationCFDModel, optim, sched,
                 model_config["n_input_channels"] - 1
                 if model_config.get("mask_channel_raw", False) else None
             ),
+            "boundary_channel_raw": bool(model_config.get("boundary_channel_raw", False)),
+            "boundary_channel_indices": model_config.get("boundary_channel_indices", []),
+            "boundary_class_names": model_config.get("boundary_class_names", []),
         },
         "pde_schema": model_config.get("pde_schema", {}),
         "pde_normalizer": model_config.get("pde_normalizer"),
@@ -424,9 +487,10 @@ def predict_next(model: FoundationCFDModel, batch: Dict, cfg: TrainConfig,
             dtype=features.dtype,
             device=features.device,
         )
-        if cfg.use_mask_channel:
+        raw_indices = input_raw_channel_indices(cfg, features.shape[2])
+        if raw_indices:
             channel_scale = channel_scale.clone()
-            channel_scale[:, :, -1:] = 0.0
+            channel_scale[:, :, raw_indices, :, :] = 0.0
         features = features + cfg.input_noise_std * channel_scale * torch.randn_like(features)
     features, context_states = _maybe_apply_pushforward(
         model,
@@ -474,6 +538,10 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         raise ValueError("--pde-law-weight must be non-negative.")
     if cfg.pde_eos_weight < 0.0:
         raise ValueError("--pde-eos-weight must be non-negative.")
+    if cfg.boundary_loss_weight < 0.0:
+        raise ValueError("--boundary-loss-weight must be non-negative.")
+    if cfg.boundary_aware_refine and not cfg.use_boundary_channels:
+        raise ValueError("--boundary-aware-refine requires --use-boundary-channels.")
     if cfg.pde_cont_loss not in {"mse", "huber"}:
         raise ValueError("--pde-cont-loss must be either 'mse' or 'huber'.")
     if cfg.pde_huber_beta <= 0.0:
@@ -500,7 +568,10 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         strides=cfg.strides,
         use_derivatives=cfg.use_derivatives,
         derivative_mode=cfg.derivative_mode,
+        use_boundary_channels=cfg.use_boundary_channels,
         use_mask_channel=cfg.use_mask_channel,
+        start_offset=cfg.start_offset,
+        t_start=cfg.t_start,
     )
     val_ds = CFDWindowDataset(
         val_paths,
@@ -509,15 +580,32 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         strides=cfg.strides,
         use_derivatives=cfg.use_derivatives,
         derivative_mode=cfg.derivative_mode,
+        use_boundary_channels=cfg.use_boundary_channels,
         use_mask_channel=cfg.use_mask_channel,
+        start_offset=cfg.start_offset,
+        t_start=cfg.t_start,
     )
     if len(train_ds) == 0 or len(val_ds) == 0:
-        raise RuntimeError("No train/val windows. Reduce --context/--horizon/--strides or add snapshots.")
+        raise RuntimeError(
+            "No train/val windows. Reduce --context/--horizon/--strides, "
+            "lower --start-offset/--t-start, or add snapshots."
+        )
     print(f"#train windows = {len(train_ds)}   #val windows = {len(val_ds)}")
+    print(f"Window start filter: start_offset={cfg.start_offset}  t_start={cfg.t_start}")
     if cfg.mask_loss and not (train_ds.has_masks and val_ds.has_masks):
         print("WARNING: mask loss requested but one or more grid files lack masks; missing masks use all-fluid defaults.")
     if cfg.use_mask_channel and not (train_ds.has_masks and val_ds.has_masks):
         print("WARNING: mask channel requested but one or more grid files lack masks; missing masks use all-fluid defaults.")
+    if cfg.use_boundary_channels and not (train_ds.has_boundary_masks and val_ds.has_boundary_masks):
+        print(
+            "WARNING: boundary channels requested but one or more grid files lack "
+            "boundary_mask; missing masks use a fluid/solid default without inlet/outlet/wall classes."
+        )
+    if cfg.boundary_loss_weight > 0.0 and not (train_ds.has_boundary_masks and val_ds.has_boundary_masks):
+        print(
+            "WARNING: boundary-weighted loss requested but one or more grid files lack "
+            "boundary_mask; boundary loss may be zero on default fluid/solid masks."
+        )
     pde_schema: Dict = {}
     pde_normalizer: Dict | None = None
     pde_class_counts: Dict = {}
@@ -594,6 +682,11 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         f"Mask channel: {'enabled' if cfg.use_mask_channel else 'disabled'}  "
         f"mask loss: {'enabled' if cfg.mask_loss else 'disabled'}"
     )
+    print(f"Boundary one-hot channels: {'enabled' if cfg.use_boundary_channels else 'disabled'}")
+    print(
+        f"Boundary loss weight: {cfg.boundary_loss_weight:g}  "
+        f"boundary-aware refine: {'enabled' if cfg.boundary_aware_refine else 'disabled'}"
+    )
     print(
         f"PDE aux loss: {'enabled' if cfg.pde_aux_loss else 'disabled'}"
         + (f"  pde_dim={cfg.pde_dim} weight={cfg.pde_aux_weight:g}" if cfg.pde_aux_loss else "")
@@ -653,6 +746,12 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
     model_cfg["pde_class_counts"] = pde_class_counts
     model_cfg["masked_channel_stats"] = bool(train_ds.has_masks)
     model_cfg["mask_channel_raw"] = bool(cfg.use_mask_channel)
+    model_cfg["boundary_channel_raw"] = bool(cfg.use_boundary_channels)
+    model_cfg["boundary_channel_indices"] = configured_boundary_channel_indices(cfg)
+    model_cfg["boundary_channel_start"] = (
+        int(model_cfg["boundary_channel_indices"][0])
+        if model_cfg["boundary_channel_indices"] else None
+    )
     save_json(out_dir / "model_config.json", model_cfg)
     if cfg.pde_aux_loss:
         save_json(out_dir / "pde_normalizer.json", {
@@ -671,11 +770,13 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
     print(f"Model params: {count_params(model):,}")
 
     mask_channel_index = C_in - 1 if cfg.use_mask_channel else None
+    boundary_channel_indices = list(model_cfg.get("boundary_channel_indices", []))
     mean, std = compute_channel_stats(
         train_loader,
         C_in,
         use_fluid_mask=bool(train_ds.has_masks),
         mask_channel_index=mask_channel_index,
+        raw_channel_indices=boundary_channel_indices,
     )
     model.normaliser.mean.copy_(mean.to(device))
     model.normaliser.std.copy_(std.to(device))
@@ -687,6 +788,9 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         "masked_channel_stats": bool(train_ds.has_masks),
         "mask_channel_raw": bool(cfg.use_mask_channel),
         "mask_channel_index": mask_channel_index,
+        "boundary_channel_raw": bool(cfg.use_boundary_channels),
+        "boundary_channel_indices": boundary_channel_indices,
+        "boundary_class_names": list(BOUNDARY_CLASS_NAMES),
     }
     save_json(out_dir / "normalizer.json", normalizer)
     if train_ds.has_masks:
@@ -695,6 +799,8 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         print("  channel stats: no saved masks found; using all grid cells")
     if cfg.use_mask_channel:
         print("  mask channel normalisation: raw binary channel (mean=0, std=1)")
+    if cfg.use_boundary_channels:
+        print("  boundary channel normalisation: raw one-hot channels (mean=0, std=1)")
     print(f"  input means: {mean.numpy().round(3)}")
     print(f"  input stds : {std.numpy().round(3)}")
 
@@ -708,6 +814,9 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         "val_loss": [],
         "train_pred_loss": [],
         "val_pred_loss": [],
+        "train_boundary_loss": [],
+        "val_boundary_loss": [],
+        "boundary_loss_weight": [],
         "train_pde_loss": [],
         "val_pde_loss": [],
         "train_pde_cont_loss": [],
@@ -736,6 +845,9 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         for key, value in {
             "train_pde_cont_loss": [],
             "val_pde_cont_loss": [],
+            "train_boundary_loss": [],
+            "val_boundary_loss": [],
+            "boundary_loss_weight": [],
             "train_pde_law_loss": [],
             "val_pde_law_loss": [],
             "train_pde_law_acc": [],
@@ -755,6 +867,7 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         model.train()
         running = 0.0
         running_pred = 0.0
+        running_boundary = 0.0
         running_pde = 0.0
         running_pde_cont = 0.0
         running_pde_law = 0.0
@@ -766,6 +879,11 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
             pred, tgt, pred_pde, true_pde = predict_next(model, batch, cfg, device, training=True)
             mask = batch["target_mask"].to(device) if cfg.mask_loss else None
             pred_loss = weighted_masked_mse(pred, tgt, mask=mask)
+            if cfg.boundary_loss_weight > 0.0:
+                boundary_mask = boundary_fluid_mask(batch, device)
+                boundary_loss = weighted_masked_mse(pred, tgt, mask=boundary_mask)
+            else:
+                boundary_loss = torch.zeros((), dtype=pred_loss.dtype, device=pred_loss.device)
             if cfg.pde_aux_loss:
                 pde_comp = pde_loss_components(
                     pred_pde,
@@ -785,7 +903,7 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
                 pde_law_acc = pde_comp["law_accuracy"]
                 pde_eos_loss = pde_comp["eos"]
                 pde_eos_acc = pde_comp["eos_accuracy"]
-                loss = pred_loss + cfg.pde_aux_weight * pde_loss
+                loss = pred_loss + cfg.boundary_loss_weight * boundary_loss + cfg.pde_aux_weight * pde_loss
             else:
                 pde_loss = torch.zeros((), dtype=pred_loss.dtype, device=pred_loss.device)
                 pde_cont_loss = pde_loss
@@ -793,7 +911,7 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
                 pde_law_acc = pde_loss
                 pde_eos_loss = pde_loss
                 pde_eos_acc = pde_loss
-                loss = pred_loss
+                loss = pred_loss + cfg.boundary_loss_weight * boundary_loss
             optim.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -801,6 +919,7 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
             sched.step()
             running += loss.item()
             running_pred += pred_loss.item()
+            running_boundary += boundary_loss.item()
             running_pde += pde_loss.item()
             running_pde_cont += pde_cont_loss.item()
             running_pde_law += pde_law_loss.item()
@@ -810,6 +929,7 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
             n_batches += 1
         train_loss = running / max(1, n_batches)
         train_pred_loss = running_pred / max(1, n_batches)
+        train_boundary_loss = running_boundary / max(1, n_batches)
         train_pde_loss = running_pde / max(1, n_batches)
         train_pde_cont_loss = running_pde_cont / max(1, n_batches)
         train_pde_law_loss = running_pde_law / max(1, n_batches)
@@ -821,6 +941,7 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         with torch.no_grad():
             val_running = 0.0
             val_pred_running = 0.0
+            val_boundary_running = 0.0
             val_pde_running = 0.0
             val_pde_cont_running = 0.0
             val_pde_law_running = 0.0
@@ -832,6 +953,11 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
                 pred, tgt, pred_pde, true_pde = predict_next(model, batch, cfg, device)
                 mask = batch["target_mask"].to(device) if cfg.mask_loss else None
                 pred_loss = weighted_masked_mse(pred, tgt, mask=mask)
+                if cfg.boundary_loss_weight > 0.0:
+                    boundary_mask = boundary_fluid_mask(batch, device)
+                    boundary_loss = weighted_masked_mse(pred, tgt, mask=boundary_mask)
+                else:
+                    boundary_loss = torch.zeros((), dtype=pred_loss.dtype, device=pred_loss.device)
                 if cfg.pde_aux_loss:
                     pde_comp = pde_loss_components(
                         pred_pde,
@@ -851,7 +977,7 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
                     pde_law_acc = pde_comp["law_accuracy"]
                     pde_eos_loss = pde_comp["eos"]
                     pde_eos_acc = pde_comp["eos_accuracy"]
-                    loss = pred_loss + cfg.pde_aux_weight * pde_loss
+                    loss = pred_loss + cfg.boundary_loss_weight * boundary_loss + cfg.pde_aux_weight * pde_loss
                 else:
                     pde_loss = torch.zeros((), dtype=pred_loss.dtype, device=pred_loss.device)
                     pde_cont_loss = pde_loss
@@ -859,9 +985,10 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
                     pde_law_acc = pde_loss
                     pde_eos_loss = pde_loss
                     pde_eos_acc = pde_loss
-                    loss = pred_loss
+                    loss = pred_loss + cfg.boundary_loss_weight * boundary_loss
                 val_running += loss.item()
                 val_pred_running += pred_loss.item()
+                val_boundary_running += boundary_loss.item()
                 val_pde_running += pde_loss.item()
                 val_pde_cont_running += pde_cont_loss.item()
                 val_pde_law_running += pde_law_loss.item()
@@ -871,6 +998,7 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
                 val_batches += 1
             val_loss = val_running / max(1, val_batches)
             val_pred_loss = val_pred_running / max(1, val_batches)
+            val_boundary_loss = val_boundary_running / max(1, val_batches)
             val_pde_loss = val_pde_running / max(1, val_batches)
             val_pde_cont_loss = val_pde_cont_running / max(1, val_batches)
             val_pde_law_loss = val_pde_law_running / max(1, val_batches)
@@ -883,6 +1011,9 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         history["val_loss"].append(val_loss)
         history["train_pred_loss"].append(train_pred_loss)
         history["val_pred_loss"].append(val_pred_loss)
+        history["train_boundary_loss"].append(train_boundary_loss)
+        history["val_boundary_loss"].append(val_boundary_loss)
+        history["boundary_loss_weight"].append(float(cfg.boundary_loss_weight))
         history["train_pde_loss"].append(train_pde_loss)
         history["val_pde_loss"].append(val_pde_loss)
         history["train_pde_cont_loss"].append(train_pde_cont_loss)
@@ -900,6 +1031,7 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         print(
             f"[ep {epoch:3d}] train={train_loss:.4e} val={val_loss:.4e} "
             f"pred={train_pred_loss:.4e}/{val_pred_loss:.4e} "
+            f"boundary={train_boundary_loss:.3e}/{val_boundary_loss:.3e} "
             f"pde={train_pde_loss:.4e}/{val_pde_loss:.4e} "
             f"cont={train_pde_cont_loss:.3e}/{val_pde_cont_loss:.3e} "
             f"law={train_pde_law_loss:.3e}/{val_pde_law_loss:.3e} "
@@ -937,6 +1069,8 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         "final_val_loss": history["val_loss"][-1],
         "final_train_pred_loss": history["train_pred_loss"][-1],
         "final_val_pred_loss": history["val_pred_loss"][-1],
+        "final_train_boundary_loss": history["train_boundary_loss"][-1],
+        "final_val_boundary_loss": history["val_boundary_loss"][-1],
         "final_train_pde_loss": history["train_pde_loss"][-1],
         "final_val_pde_loss": history["val_pde_loss"][-1],
         "final_train_pde_cont_loss": history["train_pde_cont_loss"][-1],
@@ -953,10 +1087,17 @@ def train(cfg: TrainConfig, device: str | None = None) -> Dict:
         "n_val_sims": len(val_paths),
         "n_train_windows": len(train_ds),
         "n_val_windows": len(val_ds),
+        "start_offset": cfg.start_offset,
+        "t_start": cfg.t_start,
         "model_params": count_params(model),
         "prediction_mode": cfg.prediction_mode,
         "integrator": cfg.integrator,
         "use_derivatives": cfg.use_derivatives,
+        "use_boundary_channels": cfg.use_boundary_channels,
+        "boundary_aware_refine": cfg.boundary_aware_refine,
+        "boundary_loss_weight": cfg.boundary_loss_weight,
+        "boundary_channel_raw": bool(cfg.use_boundary_channels),
+        "boundary_channel_indices": boundary_channel_indices,
         "use_mask_channel": cfg.use_mask_channel,
         "mask_loss": cfg.mask_loss,
         "masked_channel_stats": bool(train_ds.has_masks),
@@ -1006,6 +1147,10 @@ def main() -> None:
     ap.add_argument("--out", required=True, help="checkpoint directory")
     ap.add_argument("--context", type=int, default=4)
     ap.add_argument("--horizon", type=int, default=1)
+    ap.add_argument("--start-offset", type=int, default=0,
+                    help="number of saved snapshots to skip before constructing windows")
+    ap.add_argument("--t-start", type=float, default=None,
+                    help="physical time threshold for the first context frame")
     ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--lr", type=float, default=3e-4)
@@ -1034,6 +1179,12 @@ def main() -> None:
                     help="reserved for future multi-step rollout loss; currently only 1 is supported")
     ap.add_argument("--rollout-train-weight-decay", type=float, default=1.0,
                     help="reserved rollout-loss step weighting; currently recorded but inactive while steps=1")
+    ap.add_argument("--use-boundary-channels", action="store_true",
+                    help="append six static boundary-type one-hot channels as model inputs")
+    ap.add_argument("--boundary-aware-refine", action="store_true",
+                    help="concatenate the final boundary one-hot mask into the post-patch refine CNN")
+    ap.add_argument("--boundary-loss-weight", type=float, default=0.0,
+                    help="extra prediction-loss weight over inlet/outlet/obstacle/channel wall pixels")
     ap.add_argument("--use-mask-channel", action="store_true",
                     help="append the static fluid mask as an input channel")
     ap.add_argument("--mask-loss", action="store_true",
@@ -1075,6 +1226,8 @@ def main() -> None:
     args = ap.parse_args()
     if args.horizon != 1:
         ap.error(HORIZON_ERROR)
+    if args.start_offset < 0:
+        ap.error("--start-offset must be non-negative.")
     if args.input_noise_std < 0.0:
         ap.error("--input-noise-std must be non-negative.")
     if not 0.0 <= args.pushforward_prob <= 1.0:
@@ -1097,12 +1250,18 @@ def main() -> None:
         ap.error("--pde-huber-beta must be positive.")
     if args.pde_log_eps <= 0.0:
         ap.error("--pde-log-eps must be positive.")
+    if args.boundary_loss_weight < 0.0:
+        ap.error("--boundary-loss-weight must be non-negative.")
+    if args.boundary_aware_refine and not args.use_boundary_channels:
+        ap.error("--boundary-aware-refine requires --use-boundary-channels.")
 
     cfg = TrainConfig(
         grid_dir=args.grid,
         out_dir=args.out,
         context_length=args.context,
         prediction_horizon=args.horizon,
+        start_offset=args.start_offset,
+        t_start=args.t_start,
         n_epochs=args.epochs,
         batch_size=args.batch,
         lr=args.lr,
@@ -1125,6 +1284,9 @@ def main() -> None:
         pushforward_prob=args.pushforward_prob,
         rollout_train_steps=args.rollout_train_steps,
         rollout_train_weight_decay=args.rollout_train_weight_decay,
+        use_boundary_channels=args.use_boundary_channels,
+        boundary_aware_refine=args.boundary_aware_refine,
+        boundary_loss_weight=args.boundary_loss_weight,
         use_mask_channel=args.use_mask_channel,
         mask_loss=args.mask_loss,
         pde_aux_loss=args.pde_aux_loss,

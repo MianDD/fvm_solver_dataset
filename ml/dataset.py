@@ -15,6 +15,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from .boundary import BOUNDARY_CLASS_NAMES, boundary_channel_names, default_boundary_mask
 from .pde import default_pde_names, infer_pde_schema
 
 
@@ -45,11 +46,14 @@ def derivative_channel_names(base_names: Sequence[str] = TARGET_CHANNEL_NAMES) -
 
 def input_channel_names(use_derivatives: bool = False,
                         use_mask_channel: bool = False,
-                        base_names: Sequence[str] = TARGET_CHANNEL_NAMES) -> List[str]:
+                        base_names: Sequence[str] = TARGET_CHANNEL_NAMES,
+                        use_boundary_channels: bool = False) -> List[str]:
     names = (
         derivative_channel_names(base_names)
         if use_derivatives else list(base_names)
     )
+    if use_boundary_channels:
+        names = list(names) + boundary_channel_names()
     if use_mask_channel:
         names = list(names) + ["fluid_mask"]
     return names
@@ -83,9 +87,11 @@ def load_grid_record(path: str | Path) -> Dict:
 
     if "times" in z:
         times = z["times"].astype(np.float32)
+        times_available = True
     else:
         print(f"WARNING: {path.name} is missing times; using unit-spaced indices.")
         times = np.arange(states.shape[0], dtype=np.float32)
+        times_available = False
     if "channel_names" in z:
         channel_names = [str(x) for x in z["channel_names"].tolist()]
     else:
@@ -100,6 +106,26 @@ def load_grid_record(path: str | Path) -> Dict:
     else:
         mask = np.ones(states.shape[-2:], dtype=np.float32)
         mask_available = False
+    if "boundary_mask" in z:
+        boundary_mask = z["boundary_mask"].astype(np.float32)
+        if boundary_mask.ndim != 3 or boundary_mask.shape[0] != len(BOUNDARY_CLASS_NAMES):
+            raise ValueError(
+                f"{path} boundary_mask shape {boundary_mask.shape} must be "
+                f"({len(BOUNDARY_CLASS_NAMES)}, H, W)"
+            )
+        if boundary_mask.shape[-2:] != states.shape[-2:]:
+            raise ValueError(
+                f"{path} boundary_mask grid {boundary_mask.shape[-2:]} "
+                f"does not match states grid {states.shape[-2:]}"
+            )
+        boundary_mask_available = True
+    else:
+        boundary_mask = default_boundary_mask(mask)
+        boundary_mask_available = False
+    if "boundary_class_names" in z:
+        boundary_class_names = [str(x) for x in z["boundary_class_names"].tolist()]
+    else:
+        boundary_class_names = list(BOUNDARY_CLASS_NAMES)
     metadata = _json_from_npz_value(z["metadata_json"] if "metadata_json" in z else None)
     cfg = _json_from_npz_value(z["cfg_json"] if "cfg_json" in z else None)
     if not metadata:
@@ -120,6 +146,7 @@ def load_grid_record(path: str | Path) -> Dict:
         "path": str(path),
         "states": states,
         "times": times,
+        "times_available": times_available,
         "x_coords": x_coords,
         "y_coords": y_coords,
         "dx": dx,
@@ -127,6 +154,9 @@ def load_grid_record(path: str | Path) -> Dict:
         "physical_spacing": physical_spacing,
         "mask": mask,
         "mask_available": mask_available,
+        "boundary_mask": boundary_mask,
+        "boundary_mask_available": boundary_mask_available,
+        "boundary_class_names": boundary_class_names,
         "channel_names": channel_names,
         "metadata": metadata,
         "pde_vec": z["pde_vec"].astype(np.float32) if "pde_vec" in z else np.zeros(9, dtype=np.float32),
@@ -140,6 +170,35 @@ def _safe_dt(a: float, b: float, fallback: float = 1.0) -> float:
     if not np.isfinite(dt) or dt <= 0:
         return float(fallback)
     return dt
+
+
+def resolve_start_index(times: np.ndarray,
+                        times_available: bool = True,
+                        start_offset: int = 0,
+                        t_start: float | None = None,
+                        label: str | None = None,
+                        warn: bool = True) -> int:
+    """Return the earliest allowed window start index.
+
+    ``start_offset`` is an index-space lower bound.  ``t_start`` is a physical
+    time lower bound applied only when real saved times are available.  When
+    both are provided, the later starting index is used.
+    """
+    start = max(0, int(start_offset))
+    if t_start is None:
+        return start
+    if not times_available:
+        if warn:
+            name = f" for {label}" if label else ""
+            print(
+                f"WARNING: --t-start={float(t_start):g} requested{name}, "
+                "but saved times are unavailable; falling back to --start-offset."
+            )
+        return start
+    times_arr = np.asarray(times, dtype=np.float32)
+    valid = np.flatnonzero(times_arr >= float(t_start))
+    time_start = int(valid[0]) if valid.size else int(times_arr.shape[0])
+    return max(start, time_start)
 
 
 def mask_derivative_cleanup_region(mask: np.ndarray) -> np.ndarray:
@@ -241,6 +300,8 @@ def build_input_features(frames: np.ndarray, times: np.ndarray | None = None,
                          use_derivatives: bool = False,
                          derivative_mode: str = "central",
                          mask: np.ndarray | None = None,
+                         boundary_mask: np.ndarray | None = None,
+                         use_boundary_channels: bool = False,
                          use_mask_channel: bool = False) -> np.ndarray:
     if not use_derivatives:
         features = np.asarray(frames, dtype=np.float32)
@@ -255,6 +316,19 @@ def build_input_features(frames: np.ndarray, times: np.ndarray | None = None,
             mode=derivative_mode,
             mask=mask,
         )
+    if use_boundary_channels:
+        if boundary_mask is None:
+            base_mask = mask if mask is not None else np.ones(frames.shape[-2:], dtype=np.float32)
+            boundary_mask = default_boundary_mask(base_mask)
+        boundary_ch = np.asarray(boundary_mask, dtype=np.float32)
+        if boundary_ch.shape != (len(BOUNDARY_CLASS_NAMES), *features.shape[-2:]):
+            raise ValueError(
+                f"boundary_mask shape {boundary_ch.shape} must be "
+                f"({len(BOUNDARY_CLASS_NAMES)}, H, W)"
+            )
+        boundary_ch = boundary_ch[None, :, :, :]
+        boundary_ch = np.repeat(boundary_ch, features.shape[0], axis=0)
+        features = np.concatenate([features, boundary_ch], axis=1)
     if use_mask_channel:
         if mask is None:
             mask = np.ones(frames.shape[-2:], dtype=np.float32)
@@ -279,7 +353,10 @@ class CFDWindowDataset(Dataset):
                  stride: int | None = None,
                  use_derivatives: bool = False,
                  derivative_mode: str = "central",
-                 use_mask_channel: bool = False):
+                 use_mask_channel: bool = False,
+                 use_boundary_channels: bool = False,
+                 start_offset: int = 0,
+                 t_start: float | None = None):
         self.paths = [Path(p) for p in paths]
         self.context_length = int(context_length)
         self.prediction_horizon = int(prediction_horizon)
@@ -287,19 +364,33 @@ class CFDWindowDataset(Dataset):
         self.use_derivatives = bool(use_derivatives)
         self.derivative_mode = derivative_mode
         self.use_mask_channel = bool(use_mask_channel)
+        self.use_boundary_channels = bool(use_boundary_channels)
+        self.start_offset = max(0, int(start_offset))
+        self.t_start = None if t_start is None else float(t_start)
 
         self._cache: List[Dict] = []
         self.windows: List[Tuple[int, int, int]] = []  # (sim_idx, start, temporal_stride)
         span = self.context_length + self.prediction_horizon - 1
+        warned_missing_times = False
         for sim_idx, p in enumerate(self.paths):
             rec = load_grid_record(p)
             self._cache.append(rec)
             T = rec["states"].shape[0]
+            first_start = resolve_start_index(
+                rec["times"],
+                times_available=bool(rec.get("times_available", True)),
+                start_offset=self.start_offset,
+                t_start=self.t_start,
+                label=Path(rec["path"]).name,
+                warn=(self.t_start is not None and not warned_missing_times),
+            )
+            if self.t_start is not None and not bool(rec.get("times_available", True)):
+                warned_missing_times = True
             for temporal_stride in self.strides:
                 last_offset = span * temporal_stride
                 if T <= last_offset:
                     continue
-                for start in range(0, T - last_offset):
+                for start in range(first_start, T - last_offset):
                     self.windows.append((sim_idx, start, temporal_stride))
         self.uses_physical_spacing = (
             all(bool(rec["physical_spacing"]) for rec in self._cache)
@@ -307,6 +398,10 @@ class CFDWindowDataset(Dataset):
         )
         self.has_masks = (
             all(bool(rec["mask_available"]) for rec in self._cache)
+            if self._cache else False
+        )
+        self.has_boundary_masks = (
+            all(bool(rec["boundary_mask_available"]) for rec in self._cache)
             if self._cache else False
         )
         self.has_pde_vec = (
@@ -360,6 +455,8 @@ class CFDWindowDataset(Dataset):
             use_derivatives=self.use_derivatives,
             derivative_mode=self.derivative_mode,
             mask=rec["mask"],
+            boundary_mask=rec["boundary_mask"],
+            use_boundary_channels=self.use_boundary_channels,
             use_mask_channel=self.use_mask_channel,
         )
         metadata = rec["metadata"]
@@ -369,6 +466,7 @@ class CFDWindowDataset(Dataset):
             "context_states": torch.from_numpy(context.copy()).float(),
             "states": torch.from_numpy(states.copy()).float(),
             "mask": torch.from_numpy(rec["mask"].copy()).float(),
+            "boundary_mask": torch.from_numpy(rec["boundary_mask"].copy()).float(),
             "target_mask": torch.from_numpy(rec["mask"].copy()).float(),
             "times": torch.from_numpy(times.copy()).float(),
             "dt": torch.tensor(eff_dt, dtype=torch.float32),
@@ -386,7 +484,12 @@ class CFDWindowDataset(Dataset):
 
     @property
     def channel_names(self) -> List[str]:
-        return input_channel_names(self.use_derivatives, self.use_mask_channel, TARGET_CHANNEL_NAMES)
+        return input_channel_names(
+            self.use_derivatives,
+            self.use_mask_channel,
+            TARGET_CHANNEL_NAMES,
+            use_boundary_channels=self.use_boundary_channels,
+        )
 
     @property
     def target_channel_names(self) -> List[str]:
